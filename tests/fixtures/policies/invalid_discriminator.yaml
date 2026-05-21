@@ -1,0 +1,9 @@
+# INVALID: rule type 'nonexistent_type' is not one of the three
+# allowed types (regex, dictionary, statistical).
+# Expected failure: PolicyValidationError (discriminator dispatch fails).
+
+version: 1
+classifiers:
+  - name: rule
+    type: nonexistent_type
+    classification: PII

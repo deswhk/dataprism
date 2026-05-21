@@ -1,0 +1,9 @@
+# INVALID: this is not parseable YAML at all.
+# The colon-and-dash patterns below produce a YAML parsing error.
+# Expected failure: PolicyLoadError (caused by yaml.YAMLError).
+
+version: 1
+classifiers:
+  - this is: : not valid
+      : yaml: at all
+   bad indent: here

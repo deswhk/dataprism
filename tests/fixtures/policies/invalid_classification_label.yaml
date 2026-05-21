@@ -1,0 +1,10 @@
+# INVALID: classification value 'NOT_A_REAL_LABEL' is not in the
+# ClassificationLabel enum.
+# Expected failure: PolicyValidationError.
+
+version: 1
+classifiers:
+  - name: rule
+    type: dictionary
+    values: [email]
+    classification: NOT_A_REAL_LABEL

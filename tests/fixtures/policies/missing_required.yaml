@@ -1,0 +1,9 @@
+# INVALID: a rule is missing the required 'classification' field.
+# Expected failure: PolicyValidationError.
+
+version: 1
+classifiers:
+  - name: rule
+    type: dictionary
+    values: [email]
+    # classification: PII   <- intentionally absent

@@ -1,0 +1,150 @@
+# Example classification policy for dataprism.
+#
+# This file documents what a valid classification policy looks like.
+# Copy it as a starting point for your own policy and edit the rules
+# to match the data sources you govern.
+#
+# Each classifier declares a `type` field that determines the rest of
+# its shape:
+#   - regex       (target=column_name or column_value)
+#   - dictionary  (matches column names, with three match modes)
+#   - statistical (samples column values, classifies on match ratio)
+#
+# -----------------------------------------------------------------
+# Note on classification labels and regulatory frameworks
+# -----------------------------------------------------------------
+#
+# dataprism uses standardized labels that describe the KIND of
+# sensitive data, independent of which laws apply:
+#
+#   PII        - Personally Identifiable Information
+#   PHI        - Protected Health Information
+#   FINANCIAL  - Credit cards, bank accounts, financial identifiers
+#   CREDENTIAL - Passwords, API keys, secrets
+#   PUBLIC     - Explicitly non-sensitive
+#   INTERNAL   - Sensitive to the organization but not regulated
+#
+# These labels map to multiple regulatory frameworks. A column
+# classified as PII is subject to whichever laws apply based on
+# the jurisdiction where the data is stored or processed:
+#
+#   PII       -> GDPR (EU), CCPA/CPRA (California), PDPA (Singapore,
+#                Malaysia, Thailand), LGPD (Brazil), PIPL (China),
+#                APPI (Japan), POPIA (South Africa), and others
+#   PHI       -> HIPAA (US)
+#   FINANCIAL -> PCI-DSS, GLBA (US), and regional equivalents
+#
+# Framework-specific behavior (e.g. PDPA-specific retention rules)
+# can be configured separately at the policy enforcement layer.
+# Classification rules themselves identify the data; frameworks
+# determine what to do with it.
+
+version: 1
+
+classifiers:
+  # -----------------------------------------------------------------
+  # DICTIONARY RULES: match column names against a known list.
+  #
+  # The default match_mode is exact_normalized, which collapses case
+  # and separators. So "Email", "email", "e_mail", "e-mail" all match
+  # a single dictionary entry "email".
+  # -----------------------------------------------------------------
+
+  - name: common_pii_columns
+    type: dictionary
+    match_mode: exact_normalized
+    values:
+      - email
+      - phone
+      - mobile
+      - address
+      - dob
+      - dateofbirth
+      - firstname
+      - middlename
+      - lastname
+      - fullname
+      - nric
+    classification: PII
+
+  # CONTAINS_NORMALIZED is the most permissive mode. Use it only for
+  # high-signal keywords where finding the substring anywhere in the
+  # column name is strong evidence. Watch for false positives.
+  - name: pii_keywords
+    type: dictionary
+    match_mode: contains_normalized
+    values:
+      - ssn
+      - socialsecurity
+      - taxid
+      - passport
+      - driverlicense
+      - nric
+    classification: PII
+
+  # Business entity identifiers are not PII (they identify companies,
+  # not individuals), but governance often treats them as sensitive
+  # for confidentiality reasons.
+  - name: business_identifiers
+    type: dictionary
+    match_mode: exact_normalized
+    values:
+      - uen
+      - companyid
+      - companynumber
+      - businessid
+      - businessnumber
+      - registrationnumber
+    classification: INTERNAL
+
+  # -----------------------------------------------------------------
+  # REGEX RULES: pattern matching against the column name or values.
+  #
+  # target=column_name matches the column's name (one match attempt).
+  # target=column_value matches every value (deterministic, all-or-nothing).
+  # -----------------------------------------------------------------
+
+  - name: email_column_name_pattern
+    type: regex
+    target: column_name
+    pattern: '(?i)^[a-z_]*e[-_]?mail[a-z_]*$'
+    classification: PII
+
+  - name: ssn_value_format
+    type: regex
+    target: column_value
+    pattern: '^\d{3}-\d{2}-\d{4}$'
+    classification: PII
+
+  - name: nric_value_format
+    type: regex
+    target: column_value
+    pattern: '^[STFGstfg]\d{7}[A-Za-z]$'
+    classification: PII
+
+  - name: credit_card_value_format
+    type: regex
+    target: column_value
+    pattern: '^\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}$'
+    classification: FINANCIAL
+
+  # -----------------------------------------------------------------
+  # STATISTICAL RULES: sample column values and classify by ratio.
+  #
+  # Useful for catching mislabeled columns. A column named "field_3"
+  # holding emails will still be classified as PII by this rule.
+  # -----------------------------------------------------------------
+
+  - name: email_value_sampling
+    type: statistical
+    pattern: '^[\w.-]+@[\w.-]+\.\w+$'
+    sample_size: 1000
+    min_match_ratio: 0.90
+    classification: PII
+
+  - name: phone_us_value_sampling
+    type: statistical
+    pattern: '^\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}$'
+    sample_size: 500
+    min_match_ratio: 0.85
+    classification: PII

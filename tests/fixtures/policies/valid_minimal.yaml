@@ -1,0 +1,9 @@
+# Minimal valid policy: one rule, all defaults applied where possible.
+
+version: 1
+
+classifiers:
+  - name: minimal_dict
+    type: dictionary
+    values: [email]
+    classification: PII
