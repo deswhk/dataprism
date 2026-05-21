@@ -1,0 +1,30 @@
+# A fully-featured valid policy used by happy-path loader tests.
+# Exercises all three rule types and a mix of optional fields.
+
+version: 1
+
+classifiers:
+  - name: pii_columns
+    type: dictionary
+    match_mode: exact_normalized
+    values: [email, phone, ssn]
+    classification: PII
+
+  - name: email_pattern
+    type: regex
+    target: column_name
+    pattern: '(?i)^email.*$'
+    classification: PII
+
+  - name: ssn_format
+    type: regex
+    target: column_value
+    pattern: '^\d{3}-\d{2}-\d{4}$'
+    classification: PII
+
+  - name: email_sampling
+    type: statistical
+    pattern: '^[\w.-]+@[\w.-]+\.\w+$'
+    sample_size: 500
+    min_match_ratio: 0.9
+    classification: PII

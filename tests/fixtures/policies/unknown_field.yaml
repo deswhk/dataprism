@@ -1,0 +1,11 @@
+# INVALID: contains an unknown field 'extra_field'.
+# Triggered by Pydantic's extra='forbid' setting on ClassificationPolicy.
+# Expected failure: PolicyValidationError.
+
+version: 1
+extra_field: this_should_be_rejected
+classifiers:
+  - name: rule
+    type: dictionary
+    values: [email]
+    classification: PII
