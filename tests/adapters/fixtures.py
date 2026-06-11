@@ -16,6 +16,7 @@ Three database shapes:
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import create_engine, text
 
@@ -107,3 +108,75 @@ def make_multi_table_db(path: Path) -> str:
     finally:
         engine.dispose()
     return dsn
+
+
+def make_postgres_test_table(
+    dsn: str,
+    *,
+    with_data: bool = True,
+) -> str:
+    """Create a uniquely-named test table in the Postgres database.
+
+    Returns the table name. The caller is responsible for dropping
+    the table after the test (see drop_postgres_test_table).
+
+    For pytest tests, use this with a yield-fixture for automatic
+    cleanup - see test_postgres.py's test_table fixture.
+
+    Schema:
+        <table_name> (
+            id INTEGER,
+            email TEXT,
+            name TEXT,           -- one NULL row
+            active BOOLEAN,      -- real BOOLEAN type (Postgres-specific)
+            score REAL           -- one NULL row
+        )
+        - 5 rows total when with_data=True, otherwise 0 rows
+
+    Args:
+        dsn: PostgreSQL connection string (postgresql+psycopg://...)
+        with_data: If True (default), inserts 5 sample rows. If False,
+            creates an empty table.
+
+    Returns:
+        The randomly-generated table name (e.g., 'test_users_a1b2c3d4').
+    """
+    table_name = f"test_users_{uuid4().hex[:8]}"
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"""CREATE TABLE {table_name} (
+                        id INTEGER,
+                        email TEXT,
+                        name TEXT,
+                        active BOOLEAN,
+                        score REAL
+                    )"""
+                )
+            )
+            if with_data:
+                conn.execute(
+                    text(
+                        f"""INSERT INTO {table_name} VALUES
+                        (1, 'alice@example.com', 'Alice', true, 99.5),
+                        (2, 'bob@example.com', NULL, false, NULL),
+                        (3, 'charlie@example.com', 'Charlie', true, 87.2),
+                        (4, 'diana@example.com', 'Diana', true, 92.0),
+                        (5, 'eve@example.com', 'Eve', false, 50.5)"""
+                    )
+                )
+    finally:
+        engine.dispose()
+    return table_name
+
+
+def drop_postgres_test_table(dsn: str, table_name: str) -> None:
+    """Drop a test table. Safe to call on a non-existent table."""
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+    finally:
+        engine.dispose()

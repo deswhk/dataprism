@@ -2,7 +2,7 @@
 
 Data governance toolkit for relational databases. Provides audit logging,
 policy-as-code enforcement, and column classification (PII / PHI / sensitive
-tagging) with planned support for PostgreSQL, SQL Server, and Oracle.
+tagging) with support for PostgreSQL and planned support for MySQL, SQL Server, and Oracle.
 
 ## Status
 
@@ -12,10 +12,9 @@ Phase 1 complete. Phase 2 in progress.
 - Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
 - Policy engine (YAML-driven rules validated against Pydantic schemas)
 - Classification (regex, dictionary, and statistical classifiers for PII/PHI)
-- Database adapter foundation (`DatabaseAdapter` Protocol + `SqliteAdapter`)
+- Database adapters (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
 
 **In progress (v2):**
-- PostgresAdapter
 - High-level API wiring adapters + classification + audit
 - CLI scaffolding
 - Report generation
