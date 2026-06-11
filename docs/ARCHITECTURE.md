@@ -12,8 +12,9 @@ It is not a tutorial (see `README.md` for getting started), nor an API reference
 4. [Audit subsystem](#4-audit-subsystem)
 5. [Policy subsystem](#5-policy-subsystem)
 6. [Classification subsystem](#6-classification-subsystem)
-7. [Deferred decisions](#7-deferred-decisions)
-8. [Glossary](#8-glossary)
+7. [Adapters subsystem](#7-adapters-subsystem)
+8. [Deferred decisions](#8-deferred-decisions)
+9. [Glossary](#9-glossary)
 
 ## 1. Overview
 
@@ -49,15 +50,30 @@ To set expectations precisely:
 
 ### Scope and stage
 
-This is **v1** (Phase 1 of an evolving project). The realistic scope is:
+This is **v2** in progress (Phase 1 complete, Phase 2 in active development). The current scope:
 
-- Single-user, single-machine usage (no multi-writer concurrency)
-- File-based audit storage (JSON Lines + hash chain)
-- Classification only (quality, encryption, retention pillars deferred)
-- No database adapters (caller supplies column data; Phase 2 adds adapters)
-- No CLI (programmatic API only; Phase 2 adds CLI)
+**Shipped:**
+- Audit subsystem (append-only, hash-chained event log)
+- Policy subsystem (YAML schema + validation + audit integration)
+- Classification subsystem (regex, dictionary, statistical rule evaluators)
+- Adapters subsystem foundation (`DatabaseAdapter` Protocol + `SqliteAdapter`)
+
+**In progress (v2):**
+- PostgresAdapter
+- High-level API wiring adapters + engine + audit (`classify_table(...)`)
+- CLI scaffolding (`dataprism classify`, `dataprism audit verify`)
+- Report generation (text + JSON output)
+
+**Deferred (Phase 3 and beyond):**
+- Quality engine pillar
+- Encryption pillar
+- Retention pillar
+- Additional adapters (MySQL, MSSQL, Oracle)
+- Multi-writer audit (Postgres-backed audit storage)
 
 The architecture is designed so each deferred feature is additive - adding a Postgres audit backend, a CLI, or a quality engine doesn't require redesigning what exists today.
+
+For development context: single-user, single-machine usage. No multi-writer concurrency. No async I/O. These constraints are honest about v2's deployment target, not architectural limitations.
 
 
 ## 2. Subsystem map
@@ -69,6 +85,7 @@ dataprism is organized into three subsystems, each in its own Python subpackage 
 | Audit | `dataprism.audit` | Append-only, tamper-evident event log |
 | Policy | `dataprism.policy` | YAML-validated governance rules |
 | Classification | `dataprism.classification` | Apply policy rules to data, return matches |
+| Adapters | `dataprism.adapters` | Connect to databases, sample column values |
 
 ### Dependency direction
 
@@ -76,16 +93,21 @@ The subsystems depend on each other in one direction only:
 classification  --uses-->  policy
 classification  --writes-->  audit
 policy          --writes-->  audit
+adapters        (depends on nothing else in dataprism)
 audit           (depends on nothing else in dataprism)
 
 In code:
+
+```
 classification.engine     imports policy.models and audit.service
 classification.evaluators imports policy.models only
 policy.loader             imports audit.service (via the audit-wrapping function)
 policy.models             imports nothing from dataprism
 audit.*                   imports nothing from dataprism (only core.exceptions)
+adapters.*                imports nothing from dataprism (only core.exceptions)
+```
 
-This direction is deliberate. Audit is foundational - many subsystems write to it, but it knows nothing about them. Policy is a contract layer - classification uses it, but it doesn't reach into classification logic. Classification is at the top - it consumes both policy and audit.
+This direction is deliberate. Audit is foundational - many subsystems write to it, but it knows nothing about them. Policy is a contract layer - classification uses it, but it doesn't reach into classification logic. Adapters are also foundational - they read from external databases but don't import any other dataprism subsystem. Classification is at the top - it consumes policy and audit; future high-level APIs (PR 8 onwards) will compose adapters with classification to produce end-to-end workflows.
 
 There are no circular imports anywhere. If a refactor would introduce one, that's a signal something is wrong with the design.
 
@@ -112,6 +134,14 @@ The "public" surface of each subsystem is what other subsystems and the eventual
 - `ClassificationResult` - the per-match result model
 - `evaluate` - the singledispatch entry point (also the extension point for new rule types)
 
+**Adapters (`dataprism.adapters`)**
+- `DatabaseAdapter` - the Protocol any backend must satisfy
+- `SqliteAdapter` - concrete v2 implementation built on SQLAlchemy Core
+- `SamplingStrategy` - enum: SEQUENTIAL (default) or RANDOM
+- `SampledValues` - frozen dataclass with text + typed + null tracking
+- `TableInfo`, `ColumnInfo` - metadata result types
+- `AdapterError`, `AdapterConnectionError`, `AdapterQueryError` - exception hierarchy
+
 ### The "audit as cross-cutting concern" insight
 
 Notice that both policy and classification write to audit, but audit knows nothing about either. This is deliberate. Audit is *cross-cutting*: it's the substrate that records what every other subsystem does, without being coupled to any of them.
@@ -129,6 +159,8 @@ If you're reading the code for the first time, this order will help:
 5. `policy/loader.py` - YAML to validated models, plus audit integration
 6. `classification/evaluators.py` - singledispatch and pure rule evaluators
 7. `classification/engine.py` - orchestration that ties everything together
+8. `adapters/protocol.py` - second use of the Protocol pattern, plus the SampledValues data carrier
+9. `adapters/sqlite.py` - first concrete adapter, built on SQLAlchemy Core
 
 Each builds on the previous in concepts and dependencies. By the time you reach the classification engine, every pattern it uses has already appeared in an earlier file.
 
@@ -589,7 +621,187 @@ This is the right default for v1: random sampling has cost; "first N values" is 
 - **No database awareness**: the engine doesn't know about column data types, nullability, primary keys, etc. It treats everything as strings. A future engine version could honor type metadata.
 
 
-## 7. Deferred decisions
+## 7. Adapters subsystem
+
+Package: `dataprism.adapters`
+
+### Purpose
+
+Connect to real databases, read their structure, and sample column values. The classification engine (and future quality engine) consume data through this layer rather than asking callers to supply it directly.
+
+Before v2, the engine took pre-supplied column data: callers had to extract values from their database themselves and pass them in as `list[str]`. That made dataprism a Python library but not a tool. The adapter subsystem closes that gap - point dataprism at a database, get classification results without writing your own data-extraction code.
+
+The v2 deliverable is SQLite. Future versions add PostgreSQL, MySQL, MSSQL, Oracle, etc. - each as a new adapter class that satisfies the same Protocol.
+
+### Key design decisions
+
+**SQLAlchemy Core, not the ORM**
+
+dataprism uses SQLAlchemy at the Core level, not the ORM. The distinction matters:
+
+- ORM (Object-Relational Mapper): maps Python classes to tables. Useful when your application owns the schema and persists its own data.
+- Core: SQL expression language. Lower-level, closer to raw SQL.
+
+dataprism doesn't own the schema of the databases it inspects - we're reading metadata and sampling values from arbitrary tables, not persisting our own data. Core gives the right level of abstraction: dialect-agnostic SQL construction without the overhead of class-to-table mapping.
+
+The practical consequence: the same Python code works against SQLite, PostgreSQL, MSSQL, MySQL, and Oracle. SQLAlchemy translates dialect-specific differences (function names, type representations, schema concepts) under the hood. Adding a new database typically means a new adapter class with a different connection-string format, not a rewrite of the SQL.
+
+**Protocol-based extension (same Strategy pattern as audit storage)**
+
+`DatabaseAdapter` is a `typing.Protocol`. `SqliteAdapter` satisfies it structurally, without inheritance. A future `PostgresAdapter` would do the same - no base class to extend, just match the contract.
+
+This mirrors the pattern from the audit subsystem (`AuditStorage` Protocol, `JsonLinesStorage` and `InMemoryStorage` as implementations). The same architectural decision applied to a different domain. New backends are additive; no existing code changes when a new one arrives.
+
+**Path coercion at the adapter boundary**
+
+`connect()` accepts both `str` and `Path`:
+
+```python
+adapter.connect("sqlite:///path/to/db.sqlite")    # DSN string
+adapter.connect(Path("data.sqlite"))              # pathlib.Path
+```
+
+The `_normalize_dsn()` helper converts a `Path` to a DSN string. This insulates callers from one of the more annoying differences between databases - file-based databases (SQLite) use file paths, network databases (Postgres) use connection strings. The adapter accepts whichever is appropriate.
+
+This came out of the v2 scoping discussion: rather than forcing CLI code (and future API code) to construct DSNs by hand, we normalize at the protocol boundary.
+
+**SampledValues container (the Option D refinement)**
+
+`sample_values()` returns a `SampledValues` dataclass rather than a plain `list[str]`. The dataclass carries multiple representations:
+
+| Field | What it holds | Used by |
+|---|---|---|
+| `text` | Stringified values, NULLs filtered out | Classification (current) |
+| `typed` | Native Python types, NULLs preserved as None | Quality engine (future) |
+| `null_count` | Count of NULL values in the sample | Reports, quality checks |
+| `sample_size_requested` | The `n` parameter that was passed | Audit, reports |
+| `sample_size_actual` | Count of rows actually returned (may be less than `n`) | Audit, reports |
+
+Why both `text` and `typed`: classification rules pattern-match on strings; quality rules need numeric or temporal types for min/max/distribution operations. By having the adapter produce both representations in one query, we avoid round-trips and ensure the v3 quality engine has what it needs without re-fetching.
+
+The cost is small (one Python list instead of one) and avoided expensive future refactoring of every adapter when the quality engine arrives.
+
+**SEQUENTIAL is the default sampling strategy**
+
+Two strategies are available:
+
+- `SamplingStrategy.SEQUENTIAL` (default): the first `n` values in storage order. Fast (`LIMIT n`), deterministic.
+- `SamplingStrategy.RANDOM`: a random sample of `n` values. Slower (forces a full scan), statistically representative.
+
+SEQUENTIAL is the default because classification is robust to ordering - we're asking "does this column look like PII?", which doesn't depend on which N rows we look at as long as we look at enough of them. Deterministic sampling also means two classification runs against the same data produce the same audit trail, which matters for compliance reproducibility.
+
+RANDOM is available for callers that specifically want sample-level rigor. Future quality work (outlier detection, distribution analysis) is more likely to use it.
+
+**Timezone normalization in `_to_str()`**
+
+When converting datetime values to strings for the `text` field, timezone-aware datetimes are normalized to UTC before stringifying. Naive datetimes (no timezone info) are stringified as-is.
+
+This prevents subtle bugs where the same logical timestamp appears as two different strings depending on which timezone the database driver chose to report. UTC normalization gives a canonical form.
+
+The trade-off: naive datetimes can't be normalized (we don't know what timezone they're in), so they pass through unchanged. Database integrations should prefer storing timestamps with timezone info; dataprism documents the constraint rather than guessing.
+
+**NULL handling: filter in Python, not SQL**
+
+The earlier draft of `sample_values()` filtered NULLs at the SQL level (`WHERE column IS NOT NULL`). We changed this to filter in Python after fetching.
+
+Why: the SampledValues contract requires `null_count` - we need to know how many NULLs the column had in the sample. Filtering at SQL level loses that information. Fetching all rows including NULLs, then filtering for `text` while preserving `typed`, lets us populate both fields and `null_count` correctly.
+
+The cost: a column that's 99% NULL with `n=1000` requested fetches 1000 mostly-NULL rows. For pathological cases this is wasteful, but the rare and predictable nature of "almost-all-NULL columns" makes optimization premature. A future "skip NULLs at SQL level" mode could be added if real workloads need it.
+
+### Public API
+
+```python
+from pathlib import Path
+
+from dataprism.adapters.errors import (
+    AdapterConnectionError,
+    AdapterError,
+    AdapterQueryError,
+)
+from dataprism.adapters.protocol import (
+    ColumnInfo,
+    DatabaseAdapter,
+    SampledValues,
+    SamplingStrategy,
+    TableInfo,
+)
+from dataprism.adapters.sqlite import SqliteAdapter
+
+# Construct (cheap, no I/O)
+adapter = SqliteAdapter()
+
+# Open connection (may fail)
+adapter.connect(Path("mydata.sqlite"))    # accepts Path or str DSN
+
+# Use
+try:
+    tables = adapter.list_tables()           # list[TableInfo]
+    columns = adapter.list_columns("users")  # list[ColumnInfo]
+    samples = adapter.sample_values(
+        "users", "email",
+        n=1000,
+        strategy=SamplingStrategy.SEQUENTIAL,
+    )
+    # samples.text   - list[str], NULLs filtered, ready for classification
+    # samples.typed  - list[Any], NULLs preserved as None
+    # samples.null_count, samples.sample_size_actual - metadata
+finally:
+    adapter.close()
+```
+
+### Internals worth understanding
+
+**`_require_connected()` pattern**
+
+Every public method (other than `connect()` and `close()`) calls `_require_connected()` first. This raises `AdapterError` if the adapter hasn't been connected yet. Without this guard, operations on a not-connected adapter would fail with confusing `AttributeError` ("NoneType has no attribute X") from SQLAlchemy internals.
+
+The pattern is a single line per method, but it's the difference between a clear "Adapter not connected. Call connect() first." and a stack trace pointing at SQLAlchemy code that means nothing to the caller.
+
+**SQLAlchemy is lazy at connection time**
+
+`create_engine(dsn)` returns immediately, even with a bad DSN. SQLAlchemy doesn't actually open a connection until a query runs.
+
+This is good for performance but bad for catching connection errors at the right time. The adapter's `connect()` method forces a connection via `with self._engine.connect(): pass` to verify the DSN works upfront. Without this, callers would only learn about authentication failures or missing files when they later called `list_tables()`, which is misleading.
+
+**SQLAlchemy logging configuration**
+
+`sqlite.py` has this at module load time:
+
+```python
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+```
+
+Why: SQLAlchemy's default log level for the engine is INFO, which dumps every SQL query it executes. In tests this produces hundreds of lines of SQL spam that drowns out actual test output. In production it could log sensitive data.
+
+The configuration is module-level so it applies the moment anyone imports the adapter package. No call site has to remember to silence the logger.
+
+**Why we use `func.random()`, not `random()` or `RAND()`**
+
+The RANDOM sampling strategy uses SQLAlchemy's `func.random()` instead of writing raw SQL. SQLAlchemy translates this to the appropriate function for the dialect:
+
+- SQLite: `random()`
+- PostgreSQL: `random()`
+- MSSQL: `NEWID()` (yes, very different)
+- Oracle: `DBMS_RANDOM.VALUE`
+- MySQL: `RAND()`
+
+Hand-writing `ORDER BY random()` would work on SQLite and Postgres but fail on MSSQL, Oracle, and MySQL. The Core-level `func.random()` is the dialect-agnostic form that just works.
+
+### Limitations
+
+- **SQLite only in v2**: PostgreSQL, MSSQL, Oracle, MySQL adapters are deferred. Each would be ~100 lines of similar code; the Protocol is unchanged.
+- **No connection pooling**: each `SqliteAdapter` instance owns one engine. For high-throughput multi-connection scenarios, you'd want connection pooling, which SQLAlchemy supports but our adapter doesn't expose.
+- **No async**: all adapter methods are synchronous. SQLAlchemy 2.0 supports async, but adding it would be a parallel API rather than a drop-in upgrade. v2's sync scope is sufficient for CLI use; future API/service use might motivate async.
+- **No transactions across calls**: each call opens its own connection via `with self._engine.connect(): ...`. There's no notion of "do these three things in one transaction." For our read-only inspection workload, this is fine; future write-capable adapters would need transactional semantics.
+- **No schema awareness for SQLite**: the `schema` parameter on `list_tables()` is accepted (for protocol consistency) but ignored. SQLite doesn't have schemas in the Postgres sense - the parameter would be meaningful in PostgresAdapter.
+- **Sample size strict cap**: `sample_values(n=1000)` truncates at 1000 rows regardless of NULL density. If 999 of those 1000 are NULL, you get one `text` value. The contract is "fetch at most n rows from the database," not "return at most n non-NULL values."
+- **No row counts**: there's no `count_rows(table)` method. Counting rows on large tables is expensive (potentially a full scan); we don't include it until something actually needs it.
+- **No incremental sampling**: each call to `sample_values()` is independent. There's no "give me the next 1000 rows that I haven't seen yet" mode.
+- **No partition or filter support**: you can't say "sample from this column where region='APAC'". Filtering would require either threading filter clauses through the API (significant) or letting callers construct their own SQL.
+- **SQLAlchemy 2.0 dependency**: SQLAlchemy is now a hard dependency. We use Core only (no ORM), but the package size and load time aren't trivial. For environments that need a smaller footprint, this is a real cost.
+
+
+## 8. Deferred decisions
 
 dataprism v1 is intentionally small. Many things one might expect from a "complete" governance tool are explicitly not in v1. This section enumerates them and explains the reasoning, so future contributors (including future-you) can decide when each becomes worth doing.
 
@@ -613,11 +825,11 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 - **Why deferred**: Retention requires database write access and reliable scheduling. Both are out of scope for v1, which is read-only and stateless.
 - **Trigger to revisit**: When dataprism has database adapters and a scheduler (or runs inside one).
 
-### Database adapters
+### Additional database adapters
 
-- **What**: Direct integration with PostgreSQL, MSSQL, Oracle, etc. dataprism would connect, sample columns automatically, and classify without the caller having to supply data.
-- **Why deferred**: Each database driver is a non-trivial dependency (with its own quirks, transaction semantics, schema introspection). Phase 1 keeps dataprism database-agnostic by accepting pre-sampled data from the caller. This also makes testing easier - no test fixtures need a running database.
-- **Trigger to revisit**: Phase 2 of the project. The first adapter should probably be PostgreSQL, with SQLAlchemy providing the abstraction for future databases.
+- **What**: PostgreSQL, MSSQL, Oracle, MySQL adapter implementations. v2 ships `SqliteAdapter` and reserves PostgresAdapter for the immediately-next PR. The remaining adapters (MSSQL, Oracle, MySQL) are deferred.
+- **Why deferred**: Each adapter is a relatively small amount of code (~100 lines) once SQLAlchemy is in place, but each one introduces its own integration testing burden (test database, dialect-specific edge cases, CI handling). Better to validate the Protocol against two backends (SQLite + Postgres) first, then add others on demand.
+- **Trigger to revisit**: When a real-world workload needs one of the deferred backends. Adding an adapter is non-breaking - it's a new class satisfying the existing Protocol.
 
 ### CLI
 
@@ -678,12 +890,15 @@ The recurring theme in this section: dataprism v1 prioritizes correctness, clari
 The discipline of saying "not yet" repeatedly is what keeps the codebase reviewable. If you're considering reviving a deferred item, the question to ask is the trigger in the relevant bullet above. If the trigger has fired, build it. If it hasn't, save the complexity for later.
 
 
-## 8. Glossary
+## 9. Glossary
 
 Terms used throughout this document, with short definitions. dataprism-specific meanings only - general Python concepts are not defined here.
 
 **Actor**
 The "who or what" associated with an audit event. A free-form string (e.g., `"cli"`, `"scheduler"`, `"alice@example.com"`). Recorded by every audit event; passed in by the caller.
+
+**Adapter**
+The bridge between dataprism and an external database. Defined by the `DatabaseAdapter` Protocol; concrete implementations include `SqliteAdapter` (v2) and future `PostgresAdapter`. Adapters handle connection lifecycle (connect/close), schema introspection (list_tables/list_columns), and value sampling (sample_values).
 
 **Audit event**
 A record of something that happened in dataprism. Immutable after creation. Defined by `AuditEvent` and one of the `EventType` enum members. Persisted by an `AuditStorage` implementation.
@@ -706,8 +921,14 @@ Informal term for a single rule in a classification policy. Each entry in `polic
 **Composition root**
 The place in a codebase where dependencies are wired together. In dataprism, the composition root lives in the caller's code, not inside dataprism. The caller constructs storage, then service, then engine - in that order.
 
+**Dialect**
+SQLAlchemy's term for a database-specific SQL flavor. SQLite, PostgreSQL, MSSQL, etc. each have their own dialect. SQLAlchemy translates Core-level expressions (like `func.random()`) to the appropriate dialect-specific SQL automatically, which is what lets one `SqliteAdapter` implementation become a template for future `PostgresAdapter`, `MysqlAdapter`, etc.
+
 **Discriminated union**
 A Pydantic pattern where one model field (the discriminator, here always called `type`) determines which of several concrete models the data must satisfy. For `ClassificationRule`, the discriminator selects between `RegexRule`, `DictionaryRule`, and `StatisticalRule`.
+
+**DSN (Data Source Name)**
+A database connection string. SQLAlchemy uses the format `<dialect>+<driver>://<user>:<password>@<host>:<port>/<database>`. For SQLite (no network), the simpler `sqlite:///<path>` form is used. `SqliteAdapter.connect()` accepts both a DSN string and a `Path` object, normalizing the latter to a `sqlite:///<absolute path>` DSN.
 
 **Engine**
 Subsystem-level term for the code that does meaningful work with policies and data. The Phase 1 engine is `ClassificationEngine`. Future engines (`QualityEngine`, `EncryptionEngine`) will follow the same pattern.
@@ -735,6 +956,12 @@ A field on `RegexRule` specifying what the pattern matches against. Two values: 
 
 **Rule**
 A single entry in `policy.classifiers`. One of three concrete types in v1: `RegexRule`, `DictionaryRule`, or `StatisticalRule`. Each describes a pattern for identifying data and the classification label to assign.
+
+**SampledValues**
+The return type of `DatabaseAdapter.sample_values()`. A frozen dataclass carrying both `text` (stringified values with NULLs filtered out, for classification) and `typed` (native Python types with NULLs preserved as None, for the future quality engine). Also includes `null_count`, `sample_size_requested`, and `sample_size_actual` for visibility into what was actually sampled.
+
+**Sampling strategy**
+How an adapter chooses which N values to return from a column. Two strategies in v2: `SEQUENTIAL` (the first N rows, deterministic and fast - the default) and `RANDOM` (a random sample, slower but statistically representative). Defined by the `SamplingStrategy` enum in `dataprism.adapters.protocol`.
 
 **Single dispatch**
 Python's mechanism (`functools.singledispatch`) for selecting a function implementation based on the runtime type of its first argument. dataprism uses it for rule evaluation: `evaluate(rule, ...)` dispatches to one of three registered functions depending on `type(rule)`.

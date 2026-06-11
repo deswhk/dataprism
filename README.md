@@ -6,18 +6,27 @@ tagging) with planned support for PostgreSQL, SQL Server, and Oracle.
 
 ## Status
 
-Phase 1 in progress. Audit, policy, and classification subsystems shipped;
-quality checks, database adapters, and CLI planned for Phase 2.
+Phase 1 complete. Phase 2 in progress.
 
-## Phase 1 (v1) scope
+**Shipped:**
+- Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
+- Policy engine (YAML-driven rules validated against Pydantic schemas)
+- Classification (regex, dictionary, and statistical classifiers for PII/PHI)
+- Database adapter foundation (`DatabaseAdapter` Protocol + `SqliteAdapter`)
 
-- **Audit logging** - tamper-evident, append-only event log with SHA-256 hash chaining
-- **Policy engine** - YAML-driven rules validated against Pydantic schemas
-- **Classification** - regex, dictionary, and statistical classifiers for PII/PHI
+**In progress (v2):**
+- PostgresAdapter
+- High-level API wiring adapters + classification + audit
+- CLI scaffolding
+- Report generation
 
-Quality checks, encryption, retention, database adapters, and CLI are planned
-for later phases. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for
-details on deferred decisions.
+**Deferred to later phases:**
+- Quality engine, encryption, retention pillars
+- Additional database adapters (MySQL, MSSQL, Oracle)
+- Multi-writer audit support
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for design rationale,
+deferred decisions, and the full subsystem reference.
 
 ## Requirements
 
@@ -37,8 +46,9 @@ pytest
 ## Architecture
 
 For a deep dive on the design, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-It covers the three subsystems (audit, policy, classification), the cross-cutting
-design principles, what is intentionally deferred to v2 and beyond, and a glossary.
+It covers the four subsystems (audit, policy, classification, adapters),
+the cross-cutting design principles, what is intentionally deferred to
+v3 and beyond, and a glossary.
 
 If you're new to the codebase, the architecture document also includes a
 suggested reading order for the source files.
