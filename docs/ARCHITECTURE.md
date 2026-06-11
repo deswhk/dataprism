@@ -56,10 +56,9 @@ This is **v2** in progress (Phase 1 complete, Phase 2 in active development). Th
 - Audit subsystem (append-only, hash-chained event log)
 - Policy subsystem (YAML schema + validation + audit integration)
 - Classification subsystem (regex, dictionary, statistical rule evaluators)
-- Adapters subsystem foundation (`DatabaseAdapter` Protocol + `SqliteAdapter`)
+- Adapters subsystem (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
 
 **In progress (v2):**
-- PostgresAdapter
 - High-level API wiring adapters + engine + audit (`classify_table(...)`)
 - CLI scaffolding (`dataprism classify`, `dataprism audit verify`)
 - Report generation (text + JSON output)
@@ -136,7 +135,8 @@ The "public" surface of each subsystem is what other subsystems and the eventual
 
 **Adapters (`dataprism.adapters`)**
 - `DatabaseAdapter` - the Protocol any backend must satisfy
-- `SqliteAdapter` - concrete v2 implementation built on SQLAlchemy Core
+- `SqliteAdapter` - SQLite implementation (test backend, file-based)
+- `PostgresAdapter` - PostgreSQL implementation (production target)
 - `SamplingStrategy` - enum: SEQUENTIAL (default) or RANDOM
 - `SampledValues` - frozen dataclass with text + typed + null tracking
 - `TableInfo`, `ColumnInfo` - metadata result types
@@ -211,6 +211,33 @@ Two examples:
 Why: protocols and singledispatch are Python's mechanisms for "many implementations, one interface, no inheritance gymnastics." They keep extension points open without imposing a base-class hierarchy that you'd have to plan in advance.
 
 The pattern: if you find yourself writing `class MyImpl(BaseFoo):` and the only reason is to satisfy a type contract, use a Protocol instead. If you find yourself writing an isinstance chain to dispatch on type, use singledispatch.
+
+#### Why Protocol instead of inheritance, in more depth
+
+The choice of `typing.Protocol` over abstract base classes was deliberate. The trade-offs:
+
+**What we gain with Protocol (structural subtyping):**
+
+- **No fake parent in the class hierarchy.** `SqliteAdapter.__bases__` is `(object,)`, not `(DatabaseAdapter,)`. The class stands alone; its parent isn't an implementation detail of how dataprism wires together extension points.
+- **No multiple-inheritance gymnastics.** A class can satisfy multiple Protocols just by having the right methods - no diamond problem, no MRO surprises, no thinking about which parent's `__init__` gets called.
+- **Third-party classes work for free.** If an external library has a class that happens to match our `DatabaseAdapter` contract, it can be passed to dataprism without modification or a wrapper class. The contract is structural, not nominal.
+- **Tests substitute fakes effortlessly.** A `FakeAdapter` with the right method signatures works without inheriting from anything. No mocking library needed; no abstract base class to satisfy.
+- **Refactoring is cheaper.** Extracting a broader Protocol (say, `ReadableTabularSource` covering adapters, spreadsheets, and HTTP endpoints) doesn't require changing every existing class's inheritance declaration. Existing classes automatically satisfy the new Protocol if their methods match.
+
+**What inheritance would offer instead:**
+
+- **Implementation sharing via `super().method()`.** Subclasses can reuse parent code. We don't need this - adapter implementations diverge significantly between databases.
+- **Explicit "X is a Y" declaration at the class header.** Modern type checkers find the relationship through Protocol anyway; explicit declaration adds little value.
+- **Built-in `isinstance(obj, BaseClass)` checks.** With Protocol, `isinstance()` works only when the Protocol is decorated `@runtime_checkable`. We deliberately don't use `@runtime_checkable` because we never check types at runtime - we just call methods.
+
+**The mental model:**
+
+Python supports both nominal subtyping (inheritance: "X is a Y because I declared X to be a kind of Y") and structural subtyping (Protocol: "X is a Y because X has the methods that Y requires"). The two patterns coexist:
+
+- For "many implementations, one interface" - exactly what `DatabaseAdapter`, `AuditStorage`, and future Protocols solve - Protocol is the right tool.
+- For "share implementation across related classes" - which dataprism doesn't need - inheritance is the right tool.
+
+Where in the code: `AuditStorage` Protocol in `audit/storage.py`, `DatabaseAdapter` Protocol in `adapters/protocol.py`. Both follow the same pattern; both intentionally lack `@runtime_checkable`.
 
 ### YAGNI as the default for v1
 
@@ -648,7 +675,11 @@ The practical consequence: the same Python code works against SQLite, PostgreSQL
 
 **Protocol-based extension (same Strategy pattern as audit storage)**
 
-`DatabaseAdapter` is a `typing.Protocol`. `SqliteAdapter` satisfies it structurally, without inheritance. A future `PostgresAdapter` would do the same - no base class to extend, just match the contract.
+`DatabaseAdapter` is a `typing.Protocol`. Two concrete adapters satisfy it structurally in v2: `SqliteAdapter` and `PostgresAdapter`. Neither inherits from a base class - they just match the contract. Future adapters (MySQL, MSSQL, Oracle) follow the same pattern.
+
+The two v2 adapters serve complementary roles:
+- `SqliteAdapter` is the **test backend**. Fast (in-memory or temp-file SQLite), no infrastructure, exercised by 39 contract tests.
+- `PostgresAdapter` is the **production target**. Tested against real Postgres for Postgres-specific behaviors (schemas, BOOLEAN type, network failures). Validates the abstraction holds against a real-world database.
 
 This mirrors the pattern from the audit subsystem (`AuditStorage` Protocol, `JsonLinesStorage` and `InMemoryStorage` as implementations). The same architectural decision applied to a different domain. New backends are additive; no existing code changes when a new one arrives.
 
@@ -789,11 +820,11 @@ Hand-writing `ORDER BY random()` would work on SQLite and Postgres but fail on M
 
 ### Limitations
 
-- **SQLite only in v2**: PostgreSQL, MSSQL, Oracle, MySQL adapters are deferred. Each would be ~100 lines of similar code; the Protocol is unchanged.
+- **SQLite and PostgreSQL only in v2**: MSSQL, Oracle, MySQL adapters are deferred. Each would be ~150 lines following the same pattern; the Protocol is unchanged.
 - **No connection pooling**: each `SqliteAdapter` instance owns one engine. For high-throughput multi-connection scenarios, you'd want connection pooling, which SQLAlchemy supports but our adapter doesn't expose.
 - **No async**: all adapter methods are synchronous. SQLAlchemy 2.0 supports async, but adding it would be a parallel API rather than a drop-in upgrade. v2's sync scope is sufficient for CLI use; future API/service use might motivate async.
 - **No transactions across calls**: each call opens its own connection via `with self._engine.connect(): ...`. There's no notion of "do these three things in one transaction." For our read-only inspection workload, this is fine; future write-capable adapters would need transactional semantics.
-- **No schema awareness for SQLite**: the `schema` parameter on `list_tables()` is accepted (for protocol consistency) but ignored. SQLite doesn't have schemas in the Postgres sense - the parameter would be meaningful in PostgresAdapter.
+- **No schema awareness for SQLite**: the `schema` parameter on `list_tables()` is accepted (for protocol consistency) but ignored by `SqliteAdapter`. SQLite doesn't have schemas in the Postgres sense. `PostgresAdapter` honors the parameter; future MySQL/MSSQL/Oracle adapters will too.
 - **Sample size strict cap**: `sample_values(n=1000)` truncates at 1000 rows regardless of NULL density. If 999 of those 1000 are NULL, you get one `text` value. The contract is "fetch at most n rows from the database," not "return at most n non-NULL values."
 - **No row counts**: there's no `count_rows(table)` method. Counting rows on large tables is expensive (potentially a full scan); we don't include it until something actually needs it.
 - **No incremental sampling**: each call to `sample_values()` is independent. There's no "give me the next 1000 rows that I haven't seen yet" mode.
@@ -827,8 +858,8 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 
 ### Additional database adapters
 
-- **What**: PostgreSQL, MSSQL, Oracle, MySQL adapter implementations. v2 ships `SqliteAdapter` and reserves PostgresAdapter for the immediately-next PR. The remaining adapters (MSSQL, Oracle, MySQL) are deferred.
-- **Why deferred**: Each adapter is a relatively small amount of code (~100 lines) once SQLAlchemy is in place, but each one introduces its own integration testing burden (test database, dialect-specific edge cases, CI handling). Better to validate the Protocol against two backends (SQLite + Postgres) first, then add others on demand.
+- **What**: MySQL, MSSQL, Oracle adapter implementations. v2 ships `SqliteAdapter` (test backend) and `PostgresAdapter` (production target). The remaining backends are deferred.
+- **Why deferred**: Each adapter is ~150 lines following the established pattern, but each adds its own integration testing burden (test database, dialect-specific edge cases). The Protocol is validated against two backends now (SQLite + PostgreSQL); adding more is on demand.
 - **Trigger to revisit**: When a real-world workload needs one of the deferred backends. Adding an adapter is non-breaking - it's a new class satisfying the existing Protocol.
 
 ### CLI
@@ -898,7 +929,7 @@ Terms used throughout this document, with short definitions. dataprism-specific 
 The "who or what" associated with an audit event. A free-form string (e.g., `"cli"`, `"scheduler"`, `"alice@example.com"`). Recorded by every audit event; passed in by the caller.
 
 **Adapter**
-The bridge between dataprism and an external database. Defined by the `DatabaseAdapter` Protocol; concrete implementations include `SqliteAdapter` (v2) and future `PostgresAdapter`. Adapters handle connection lifecycle (connect/close), schema introspection (list_tables/list_columns), and value sampling (sample_values).
+The bridge between dataprism and an external database. Defined by the `DatabaseAdapter` Protocol; v2 ships `SqliteAdapter` (test backend) and `PostgresAdapter` (production target). Future implementations will add MySQL, MSSQL, and Oracle. Adapters handle connection lifecycle (connect/close), schema introspection (list_tables/list_columns), and value sampling (sample_values).
 
 **Audit event**
 A record of something that happened in dataprism. Immutable after creation. Defined by `AuditEvent` and one of the `EventType` enum members. Persisted by an `AuditStorage` implementation.
@@ -922,7 +953,7 @@ Informal term for a single rule in a classification policy. Each entry in `polic
 The place in a codebase where dependencies are wired together. In dataprism, the composition root lives in the caller's code, not inside dataprism. The caller constructs storage, then service, then engine - in that order.
 
 **Dialect**
-SQLAlchemy's term for a database-specific SQL flavor. SQLite, PostgreSQL, MSSQL, etc. each have their own dialect. SQLAlchemy translates Core-level expressions (like `func.random()`) to the appropriate dialect-specific SQL automatically, which is what lets one `SqliteAdapter` implementation become a template for future `PostgresAdapter`, `MysqlAdapter`, etc.
+SQLAlchemy's term for a database-specific SQL flavor. SQLite, PostgreSQL, MSSQL, etc. each have their own dialect. SQLAlchemy translates Core-level expressions (like `func.random()`) to the appropriate dialect-specific SQL automatically, which is what lets `SqliteAdapter` and `PostgresAdapter` share most of their implementation and lets future `MysqlAdapter`, `MssqlAdapter`, `OracleAdapter` follow the same pattern.
 
 **Discriminated union**
 A Pydantic pattern where one model field (the discriminator, here always called `type`) determines which of several concrete models the data must satisfy. For `ClassificationRule`, the discriminator selects between `RegexRule`, `DictionaryRule`, and `StatisticalRule`.
