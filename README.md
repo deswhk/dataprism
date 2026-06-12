@@ -11,11 +11,10 @@ Phase 1 complete. Phase 2 in progress.
 **Shipped:**
 - Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
 - Policy engine (YAML-driven rules validated against Pydantic schemas)
-- Classification (regex, dictionary, and statistical classifiers for PII/PHI)
+- Classification (regex, dictionary, and statistical classifiers; high-level `classify_table` API)
 - Database adapters (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
 
 **In progress (v2):**
-- High-level API wiring adapters + classification + audit
 - CLI scaffolding
 - Report generation
 

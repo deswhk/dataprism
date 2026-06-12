@@ -55,11 +55,10 @@ This is **v2** in progress (Phase 1 complete, Phase 2 in active development). Th
 **Shipped:**
 - Audit subsystem (append-only, hash-chained event log)
 - Policy subsystem (YAML schema + validation + audit integration)
-- Classification subsystem (regex, dictionary, statistical rule evaluators)
+- Classification subsystem (regex, dictionary, statistical rule evaluators, plus high-level `classify_table` API)
 - Adapters subsystem (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
 
 **In progress (v2):**
-- High-level API wiring adapters + engine + audit (`classify_table(...)`)
 - CLI scaffolding (`dataprism classify`, `dataprism audit verify`)
 - Report generation (text + JSON output)
 
@@ -492,7 +491,10 @@ Package: `dataprism.classification`
 
 ### Purpose
 
-Apply policy rules to columns and return matches. Given a loaded `ClassificationPolicy` and a column (its name plus optional sample values), the engine evaluates every rule and returns one `ClassificationResult` per match. Every call also records a `CLASSIFICATION_RUN` audit event.
+Apply policy rules to columns and return matches. The subsystem exposes two APIs at different abstraction levels:
+
+- **`ClassificationEngine.classify(column_name, values)`** - the per-column workhorse. Given a loaded `ClassificationPolicy` and a column (its name plus optional sample values), the engine evaluates every rule and returns one `ClassificationResult` per match. Every call records a `CLASSIFICATION_RUN` audit event.
+- **`classify_table(adapter, table, policy, audit)`** - the table-level convenience. Combines a `DatabaseAdapter` with the engine to classify every column in one call. Emits `TABLE_CLASSIFICATION_STARTED`/`TABLE_CLASSIFICATION_COMPLETED` events around the per-column work, collects per-column errors in a `TableClassificationReport`, and returns the full picture.
 
 This is the first subsystem that *does* something with data, as opposed to defining or storing rules. Audit is the substrate and policy is the language; classification is the first real application.
 
@@ -565,6 +567,21 @@ The result model stores classification as `str`, not `ClassificationLabel`. This
 
 The trade-off: callers wanting type-safe comparisons (`if result.classification == ClassificationLabel.PII:`) would need to compare against the enum's `.value` (`"PII"`) instead. Acceptable for v1; could revisit if a real call site finds this awkward.
 
+**Two-level API: engine for per-column, classify_table for table-wide**
+
+The subsystem exposes the workhorse (`ClassificationEngine.classify`) and a convenience wrapper (`classify_table`). The wrapper handles the common case ("classify every column in this table") with sensible defaults; the engine remains available for callers who need more control.
+
+The wrapper makes four assumptions baked into the function signature, which lower-level callers escape by using the engine directly:
+
+- Table-wide sampling: one `sample_size` and `strategy` applied to every column (no per-column overrides)
+- Whole-table iteration: every column is classified (no subset selection)
+- Engine constructed internally from `policy` + `audit` + `actor`
+- Connection lifecycle is the caller's responsibility (adapter passed in already connected)
+
+Per-column failures during the wrapper run are caught and recorded in the returned `TableClassificationReport`'s `errors` list rather than aborting the run. `TABLE_CLASSIFICATION_STARTED` and `TABLE_CLASSIFICATION_COMPLETED` bracket the per-column events, giving the audit log both column-level traceability and table-level demarcation.
+
+The pattern: the wrapper is what the CLI in PR 10 will call; the engine is what programmatic callers reach for when they need finer control.
+
 ### Public API
 
 ```python
@@ -587,12 +604,38 @@ results = engine.classify(
 # results: list[ClassificationResult]
 # One entry per matched rule, empty list if nothing matched.
 
+```markdown
 # For extension - register a new rule type's evaluator:
 from dataprism.classification.evaluators import evaluate
 
 @evaluate.register
 def _(rule: MyCustomRule, column_name, values):
     ...
+```
+
+For table-level classification with an adapter, use the higher-level `classify_table`:
+
+```python
+from dataprism.adapters.postgres import PostgresAdapter
+from dataprism.classification.table import classify_table, TableClassificationReport
+from dataprism.policy.loader import load_classification_policy
+
+adapter = PostgresAdapter()
+adapter.connect("postgresql+psycopg://user:pass@host:5432/db")
+try:
+    policy = load_classification_policy(Path("policy.yaml"))
+    audit = AuditService(JsonLinesStorage(Path("audit.jsonl")))
+
+    report = classify_table(
+        adapter, "public.users", policy, audit,
+        sample_size=1000,                              # default
+        strategy=SamplingStrategy.SEQUENTIAL,          # default
+        actor="cli-user",
+    )
+    # report is a TableClassificationReport with:
+    #   table, columns_attempted, matches_by_column, errors
+finally:
+    adapter.close()
 ```
 
 ### Internals worth understanding
@@ -642,7 +685,7 @@ This is the right default for v1: random sampling has cost; "first N values" is 
 
 - **No precedence between matching rules**: all matches are returned. If a column matches both a PII rule and a FINANCIAL rule, both appear in results. The caller resolves conflicts.
 - **No incremental classification**: each `classify()` call evaluates all rules. There's no caching of "this rule already matched this column last time."
-- **No batch interface**: classifying many columns means many `classify()` calls. A future `classify_many()` could batch audit events and amortize policy iteration; v1 keeps the simple per-column API.
+- **No multi-table batch interface**: `classify_table` covers one table per call. Classifying many tables means many calls (no schema-level "classify everything" yet). A future `classify_schema()` or `classify_database()` could amortize policy iteration across tables; v2 keeps the per-table scope.
 - **Statistical sampling is sequential, not random**: `sample_size` takes the first N values. For statistically rigorous sampling, the caller must shuffle first.
 - **Regex patterns are not pre-compiled**: each evaluator call compiles its pattern fresh. For policies with many statistical rules evaluated against many columns, this is measurable overhead. Caching could be added if measurement shows it matters.
 - **No database awareness**: the engine doesn't know about column data types, nullability, primary keys, etc. It treats everything as strings. A future engine version could honor type metadata.
@@ -909,6 +952,12 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 - **What**: Compiled-regex caching, parallel rule evaluation, batch classification, lazy iteration over large value lists.
 - **Why deferred**: No measurements indicate they're needed. Premature optimization is widely known to be a mistake; speculative optimization is its quieter cousin.
 - **Trigger to revisit**: When profiling shows classification is the bottleneck in a real deployment. Then optimize the specific hot path, not "everything that might be slow."
+
+### Test helper consolidation
+
+- **What**: Test helpers like `_make_engine`, `_dict_rule`, `_regex_rule` are duplicated between `tests/classification/test_engine.py` and `tests/classification/test_table.py`. The database-setup helper `make_users_db` is also duplicated between `tests/adapters/fixtures.py` and `tests/classification/test_table.py`. Combined duplication is around 60 lines.
+- **Why deferred**: When `test_table.py` was added in PR 9, extracting shared helpers would have required restructuring the `tests/` directory (adding `tests/__init__.py` to enable cross-subpackage imports, or creating a `tests/classification/fixtures.py` module). Both broaden PR 9's scope. The existing pattern is "fixtures live inside the subpackage that uses them"; the PR 9 deviation is to copy what's needed locally and document the duplication.
+- **Trigger to revisit**: When (a) a third test subpackage needs the classification helpers, OR (b) the `test_engine.py` and `test_table.py` copies diverge, OR (c) a more ambitious test-infrastructure refactor is undertaken (e.g., adding `tests/__init__.py`). At that point, extract shared helpers to `tests/classification/fixtures.py` and update both files to import from there.
 
 ### General pattern: the YAGNI commitment
 
