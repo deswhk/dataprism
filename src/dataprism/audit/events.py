@@ -29,6 +29,8 @@ class EventType(StrEnum):
     POLICY_VALIDATION_FAILED = "policy_validation_failed"
     CLASSIFICATION_RUN = "classification_run"
     CLASSIFICATION_FAILED = "classification_failed"
+    TABLE_CLASSIFICATION_STARTED = "table_classification_started"
+    TABLE_CLASSIFICATION_COMPLETED = "table_classification_completed"
     QUALITY_CHECK_RUN = "quality_check_run"
     QUALITY_CHECK_FAILED = "quality_check_failed"
 
