@@ -78,12 +78,7 @@ class TestLoadClassificationPolicy:
     def test_loads_example_policy_file(self):
         """The shipped example policy must validate against the schema.
         If this test fails, either the example file or the schema is wrong."""
-        example_path = (
-            Path(__file__).parent.parent.parent
-            / "config"
-            / "policies"
-            / "classification.example.yaml"
-        )
+        example_path = Path(__file__).parent.parent.parent / "config" / "policies" / "example.yaml"
         policy = load_classification_policy(example_path)
         assert policy.version >= 1
         assert len(policy.classifiers) > 0

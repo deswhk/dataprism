@@ -72,3 +72,4 @@ dmypy.json
 # Project-specific
 *.log
 *.local.yaml
+audit/
