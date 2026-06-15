@@ -13,6 +13,7 @@ monkeypatch fixture to set/unset this per-test.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,19 @@ from typer.testing import CliRunner
 
 from dataprism.cli import paths as cli_paths
 from dataprism.cli.main import app
+
+# Strip ANSI escape sequences from rich-formatted output.
+# rich (used by typer) inserts ANSI codes for bold, color, etc. even
+# when stdout is being captured. The codes can split logical words
+# like '--table' across multiple escape sequences, breaking simple
+# substring assertions. This regex removes them so tests can match
+# plain text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHfABCDJ]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
 
 runner = CliRunner()
 
@@ -31,12 +45,11 @@ def wide_terminal(monkeypatch):
 
     rich (used by typer) detects terminal width and truncates help
     output to fit. In CI environments (no TTY), the default width is
-    narrow and option names get truncated mid-word (e.g. '--table'
-    becomes '...'). Setting COLUMNS to a wide fixed value makes
-    rendering reproducible across local (Windows) and CI (Linux).
+    narrow and option names get truncated mid-word. Setting COLUMNS
+    to a large fixed value makes rendering reproducible across local
+    (Windows) and CI (Linux) environments.
     """
     monkeypatch.setenv("COLUMNS", "200")
-    monkeypatch.setenv("NO_COLOR", "1")
 
 
 # ---- Test helpers ---------------------------------------------------
@@ -93,40 +106,46 @@ class TestHelpText:
         """dataprism --help shows the top-level usage."""
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        assert "table" in result.stdout
-        assert "audit" in result.stdout
+        stdout = _strip_ansi(result.stdout)
+        assert "table" in stdout
+        assert "audit" in stdout
 
     def test_table_group_help(self):
         """dataprism table --help shows the table subcommands."""
         result = runner.invoke(app, ["table", "--help"])
         assert result.exit_code == 0
-        assert "classify" in result.stdout
+        stdout = _strip_ansi(result.stdout)
+        assert "classify" in stdout
 
     def test_table_classify_help(self):
         """dataprism table classify --help shows the options."""
         result = runner.invoke(app, ["table", "classify", "--help"])
         assert result.exit_code == 0
-        assert "--table" in result.stdout
-        assert "--policy" in result.stdout
-        assert "--output" in result.stdout
+        stdout = _strip_ansi(result.stdout)
+        assert "--table" in stdout
+        assert "--policy" in stdout
+        assert "--output" in stdout
 
     def test_audit_group_help(self):
         """dataprism audit --help shows the audit subcommands."""
         result = runner.invoke(app, ["audit", "--help"])
         assert result.exit_code == 0
-        assert "verify" in result.stdout
+        stdout = _strip_ansi(result.stdout)
+        assert "verify" in stdout
 
     def test_audit_verify_help(self):
         """dataprism audit verify --help shows the options."""
         result = runner.invoke(app, ["audit", "verify", "--help"])
         assert result.exit_code == 0
-        assert "--output" in result.stdout
+        stdout = _strip_ansi(result.stdout)
+        assert "--output" in stdout
 
     def test_no_args_shows_help(self):
         """dataprism (no args) shows help (per no_args_is_help=True)."""
         result = runner.invoke(app, [])
+        stdout = _strip_ansi(result.stdout)
         # Typer/click returns exit code 2 when showing help due to no_args_is_help
-        assert "Usage:" in result.stdout or "table" in result.stdout
+        assert "Usage:" in stdout or "table" in stdout
 
 
 # ---- DSN env var handling -------------------------------------------
