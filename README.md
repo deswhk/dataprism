@@ -13,9 +13,9 @@ Phase 1 complete. Phase 2 in progress.
 - Policy engine (YAML-driven rules validated against Pydantic schemas)
 - Classification (regex, dictionary, and statistical classifiers; high-level `classify_table` API)
 - Database adapters (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
+- Command-line interface (`dataprism table classify`, `dataprism audit verify`)
 
 **In progress (v2):**
-- CLI scaffolding
 - Report generation
 
 **Deferred to later phases:**
@@ -41,10 +41,46 @@ pre-commit install
 pytest
 ```
 
+## Usage
+
+Once installed, dataprism provides a CLI. Set your database DSN once per session:
+
+```powershell
+$env:DATAPRISM_DSN = "postgresql://user:pass@host:5432/mydb"
+```
+
+Then classify columns in a table against a policy:
+
+```powershell
+# Policies live in config/policies/<name>.yaml
+# The shipped example is config/policies/example.yaml
+dataprism table classify --table users --policy example
+```
+
+Output is human-readable text by default. For machine-readable output, use `--output json`:
+
+```powershell
+dataprism table classify --table users --policy example --output json
+```
+
+Every classification appends to the audit log at `audit/audit.jsonl`. Verify the chain is intact:
+
+```powershell
+dataprism audit verify
+```
+
+For full command help:
+
+```powershell
+dataprism --help
+dataprism table classify --help
+dataprism audit verify --help
+```
+
 ## Architecture
 
 For a deep dive on the design, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-It covers the four subsystems (audit, policy, classification, adapters),
+It covers the five subsystems (audit, policy, classification, adapters, CLI),
 the cross-cutting design principles, what is intentionally deferred to
 v3 and beyond, and a glossary.
 
