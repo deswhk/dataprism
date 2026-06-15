@@ -13,8 +13,9 @@ It is not a tutorial (see `README.md` for getting started), nor an API reference
 5. [Policy subsystem](#5-policy-subsystem)
 6. [Classification subsystem](#6-classification-subsystem)
 7. [Adapters subsystem](#7-adapters-subsystem)
-8. [Deferred decisions](#8-deferred-decisions)
-9. [Glossary](#9-glossary)
+8. [CLI subsystem](#8-cli-subsystem)
+9. [Deferred decisions](#9-deferred-decisions)
+10. [Glossary](#10-glossary)
 
 ## 1. Overview
 
@@ -45,7 +46,6 @@ To set expectations precisely:
 
 - **Not a framework**: it does not control your program's flow. You call its functions; it doesn't call yours.
 - **Not a service**: there is no background process, no HTTP server, no daemon. dataprism runs inside whatever program imports it.
-- **Not a database adapter**: dataprism does not connect to databases. You supply column names and sample values; database integration is a future addition.
 - **Not a complete compliance solution**: it produces audit trails and classification, which are inputs to compliance, not compliance itself.
 
 ### Scope and stage
@@ -57,10 +57,10 @@ This is **v2** in progress (Phase 1 complete, Phase 2 in active development). Th
 - Policy subsystem (YAML schema + validation + audit integration)
 - Classification subsystem (regex, dictionary, statistical rule evaluators, plus high-level `classify_table` API)
 - Adapters subsystem (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
+- CLI subsystem (`dataprism table classify`, `dataprism audit verify`)
 
 **In progress (v2):**
-- CLI scaffolding (`dataprism classify`, `dataprism audit verify`)
-- Report generation (text + JSON output)
+- Report generation (richer text + JSON output, possibly HTML)
 
 **Deferred (Phase 3 and beyond):**
 - Quality engine pillar
@@ -76,7 +76,7 @@ For development context: single-user, single-machine usage. No multi-writer conc
 
 ## 2. Subsystem map
 
-dataprism is organized into three subsystems, each in its own Python subpackage under `src/dataprism/`:
+dataprism is organized into five subsystems, each in its own Python subpackage under `src/dataprism/`:
 
 | Subsystem | Package | Purpose |
 |---|---|---|
@@ -84,6 +84,7 @@ dataprism is organized into three subsystems, each in its own Python subpackage 
 | Policy | `dataprism.policy` | YAML-validated governance rules |
 | Classification | `dataprism.classification` | Apply policy rules to data, return matches |
 | Adapters | `dataprism.adapters` | Connect to databases, sample column values |
+| CLI | `dataprism.cli` | Command-line interface wiring subsystems together |
 
 ### Dependency direction
 
@@ -93,6 +94,7 @@ classification  --writes-->  audit
 policy          --writes-->  audit
 adapters        (depends on nothing else in dataprism)
 audit           (depends on nothing else in dataprism)
+cli             --calls-->  classification, audit, policy, adapters
 
 In code:
 
@@ -103,6 +105,7 @@ policy.loader             imports audit.service (via the audit-wrapping function
 policy.models             imports nothing from dataprism
 audit.*                   imports nothing from dataprism (only core.exceptions)
 adapters.*                imports nothing from dataprism (only core.exceptions)
+cli.*                     imports from classification, audit, policy, adapters
 ```
 
 This direction is deliberate. Audit is foundational - many subsystems write to it, but it knows nothing about them. Policy is a contract layer - classification uses it, but it doesn't reach into classification logic. Adapters are also foundational - they read from external databases but don't import any other dataprism subsystem. Classification is at the top - it consumes policy and audit; future high-level APIs (PR 8 onwards) will compose adapters with classification to produce end-to-end workflows.
@@ -875,7 +878,139 @@ Hand-writing `ORDER BY random()` would work on SQLite and Postgres but fail on M
 - **SQLAlchemy 2.0 dependency**: SQLAlchemy is now a hard dependency. We use Core only (no ORM), but the package size and load time aren't trivial. For environments that need a smaller footprint, this is a real cost.
 
 
-## 8. Deferred decisions
+## 8. CLI subsystem
+
+### Purpose
+
+Provide a command-line interface that exposes dataprism's programmatic API to users who want to run classification and audit operations from a terminal without writing Python. The CLI is a thin wiring layer over the subsystems below it - it takes shell input, resolves paths, selects adapters, calls into `classify_table` and audit storage, and renders results. No business logic lives in the CLI itself.
+
+### Key design decisions
+
+**Typer over argparse or click**
+
+dataprism's CLI uses Typer (a typer-on-click library by the FastAPI author). Three reasons:
+
+1. *Type-driven*. Typer reads function type hints to define the CLI interface. Function signatures *are* the CLI; no separate parser configuration. This matches dataprism's project-wide convention of Pydantic + strict typing.
+2. *Built on click*. Typer is a thin layer over click, inheriting click's mature ecosystem (testing utilities, plugin patterns, rich-based output).
+3. *Less boilerplate*. For a moderately complex CLI with subcommand groups (`table`, `audit`), Typer's declarative style is shorter than the argparse equivalent.
+
+Trade-off: Typer's API style can feel unusual at first (`typer.Option(...)` as parameter defaults, ellipsis for required values, B008 conflicts with the standard flake8-bugbear rule which we suppress for `typer.Option` and `typer.Argument` in `pyproject.toml`). For dataprism's scope, these are minor; type-safety and brevity wins dominate.
+
+**Nested command structure by domain**
+
+Commands are grouped by what they operate on, not by verb:
+
+```
+dataprism table classify ...
+dataprism audit verify
+```
+
+Not flat (`dataprism classify`, `dataprism verify`). The nested form makes domain boundaries explicit and scales when we add more verbs (`dataprism table inspect`, `dataprism policy list`, etc.). The cost is one extra word per invocation; the benefit is structure that mirrors the subsystems.
+
+**Env-var-only DSN; explicit policy and output flags**
+
+The DSN is read exclusively from `DATAPRISM_DSN`. There is no `--dsn` CLI flag. Two reasons:
+
+1. *Password safety*. DSNs typically contain passwords. CLI flags end up in shell history; env vars don't (with normal usage).
+2. *Set-and-forget*. A typical workflow is "set DSN once per session, then run many commands." Hiding the DSN behind an env var reflects that.
+
+Other parameters (`--policy`, `--output`, `--actor`) are CLI flags. They vary per command and need to be explicit at the call site.
+
+**Audit log lives at `<project-root>/audit/audit.jsonl`**
+
+The audit log path is fixed; the user cannot specify it. Reasoning:
+
+1. *Governance principle*. Audit logs aren't user data - they're system data that records what dataprism did. Letting the user redirect them undermines the audit story.
+2. *Self-contained project model*. dataprism is currently a clone-and-use tool, not a pip-installable library. The project root is well-defined (the directory containing `pyproject.toml`), and the audit log lives in that root, alongside `config/`. The code walks up from `dataprism.__file__` to find the root.
+
+The trade-off: dataprism cannot currently be distributed via PyPI because the path-walking-up approach fails when installed into `site-packages/`. Documented as a deferred decision (PyPI distribution / workspace model) in this section's successor.
+
+**Policy resolution by name, not path**
+
+The `--policy NAME` argument resolves to `config/policies/NAME.yaml` in the project root. Full paths are not accepted.
+
+Reasoning:
+
+1. *Encourages consistent placement*. Policy files belong in one place. Naming-only resolution enforces this without needing additional checks.
+2. *Less typing*. `--policy example` is shorter than `--policy ./config/policies/example.yaml`.
+3. *Better error messages*. When the name isn't found, the CLI can list available policies, since they're all in one directory.
+
+**Auto-detect adapter from DSN prefix**
+
+The CLI selects between `SqliteAdapter` and `PostgresAdapter` based on the DSN's URL scheme:
+
+- `sqlite://...` -> `SqliteAdapter`
+- `postgresql://...` -> `PostgresAdapter`
+
+There is no `--adapter` flag; the DSN's prefix is the canonical disambiguator. The CLI also normalizes the prefix internally: users type `postgresql://`, but SQLAlchemy needs `postgresql+psycopg://` to use psycopg v3 (over the older psycopg2 default). The translation happens transparently in `cli/adapters.py`.
+
+**Python render functions, no template engine**
+
+Output rendering (text and JSON) uses small Python functions in `cli/render.py`, not Jinja2 or another template engine. Two formats fit comfortably in ~30 lines of Python each; templates would be over-engineering at this scale. If a third format (HTML, Markdown) becomes desirable, the migration path is clear (see deferred decisions).
+
+### Public API
+
+```python
+from dataprism.cli.main import app, main
+
+# `main` is the entry point registered in pyproject.toml as `dataprism = "dataprism.cli:main"`.
+# `app` is the Typer instance for tests using `typer.testing.CliRunner`.
+```
+
+Internally, the package is organized into:
+
+```
+src/dataprism/cli/
++-- __init__.py    # re-exports `main`
++-- main.py        # Typer app and command implementations
++-- paths.py       # get_project_root, get_audit_log_path, get_policy_path
++-- adapters.py    # normalize_dsn, select_adapter
++-- render.py      # render_text, render_json
+```
+
+Each module has one job:
+
+- `paths`: filesystem concerns (project root discovery, audit log path, policy name resolution)
+- `adapters`: DSN handling (normalization, adapter class selection)
+- `render`: output formatting (text and JSON)
+- `main`: Typer wiring (commands, argument parsing, error handling, end-to-end orchestration)
+
+### Internals worth understanding
+
+**Project root discovery via `dataprism.__file__`**
+
+`cli/paths.py:get_project_root()` walks up from the location of `dataprism/__init__.py` to find the directory containing `pyproject.toml`. This assumes dataprism is being used from a checked-out source tree (the layout is `<root>/src/dataprism/__init__.py`). If `__file__` resolves into `site-packages/`, the walk fails and a `RuntimeError` is raised with a clear message pointing at the deferred PyPI workflow.
+
+This is the same mechanism used for all path-resolution operations - audit log location, policy file lookup, even sanity checks for "are we in a valid dataprism project?"
+
+**Exit codes**
+
+The CLI uses three exit codes consistently:
+
+- `0` - success
+- `1` - runtime error (database failed to connect, table missing, chain verification failed)
+- `2` - misuse (missing env var, policy not found, audit log missing for verify)
+
+Standard Unix convention. Scripts can branch on these reliably.
+
+**Error messages go to stderr**
+
+Success output (the report, the verification result) goes to stdout. Error messages go to stderr via `typer.echo(..., err=True)`. This lets users pipe stdout (e.g., JSON output) to other tools while still seeing errors interactively.
+
+**`--output json` mode is parseable**
+
+In JSON mode, only the JSON document goes to stdout - no "Audit log: ..." trailer. This keeps the output safely pipeable to `jq`, `ConvertFrom-Json`, or any JSON consumer. Text mode includes the audit log path as a human convenience after the report.
+
+### Limitations
+
+- **Self-contained project model only**: dataprism cannot be `pip install`ed yet. Source must be cloned. The path-resolution approach (walk up from `__file__`) breaks in `site-packages/`. See deferred decisions for the workspace model.
+- **Two output formats**: text and JSON. Adding more (HTML, Markdown, CSV) would benefit from a template engine; deferred.
+- **No CLI config file**: each invocation reads its own env vars and flags. If a user wants the same `--policy` for many commands, they retype it. Deferred until friction is observed.
+- **Per-table operation only**: `dataprism table classify --table users` operates on one table at a time. A future `dataprism schema classify --schema public` for batch operation would build on the same primitives.
+- **No completion auto-generated for the user**: Typer supports shell completion via `--install-completion`, but dataprism doesn't promote this in docs or README. It works, but as an advanced feature.
+
+
+## 9. Deferred decisions
 
 dataprism v1 is intentionally small. Many things one might expect from a "complete" governance tool are explicitly not in v1. This section enumerates them and explains the reasoning, so future contributors (including future-you) can decide when each becomes worth doing.
 
@@ -905,11 +1040,23 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 - **Why deferred**: Each adapter is ~150 lines following the established pattern, but each adds its own integration testing burden (test database, dialect-specific edge cases). The Protocol is validated against two backends now (SQLite + PostgreSQL); adding more is on demand.
 - **Trigger to revisit**: When a real-world workload needs one of the deferred backends. Adding an adapter is non-breaking - it's a new class satisfying the existing Protocol.
 
-### CLI
+### CLI config file for shared settings
 
-- **What**: A `dataprism` command-line tool: `dataprism classify --policy policies/x.yaml --table mydb.users`.
-- **Why deferred**: A CLI is a thin layer over the programmatic API. Until the API surface stabilizes, a CLI would have to change every time something underneath changes. Building it after the programmatic API is settled is more efficient.
-- **Trigger to revisit**: Once Phase 2 lands database adapters. Then "dataprism classify against a real database" becomes a useful CLI command.
+- **What**: A configuration file (e.g., `~/.dataprism/config.yaml` or `./.dataprism.yaml`) that holds shared CLI settings — default policy name, default output format, optional default actor name. The CLI reads it on each invocation so users don't repeat the same flags.
+- **Why deferred**: PR 10's CLI ships with two ways to pass settings: CLI flags (per-command) and environment variables (per-session, for DSN only). Both are sufficient for v2's typical workflow ("set DSN once per session, specify table and policy per command"). Adding a config file means another precedence layer (file < env var < flag), more documentation, and a parser; the cost outweighs the benefit until users complain about repeated flags.
+- **Trigger to revisit**: When users repeatedly set the same `--policy` and `--output` flags across many commands in a session, or when the CLI gains enough flags that ad-hoc invocation becomes painful. Then add a single-file config with a strict schema.
+
+### Template engine for richer rendering
+
+- **What**: A template engine (Jinja2 or similar) for rendering classification results, replacing the current Python render functions in `cli/render.py`. Would enable richer output formats (HTML reports, CSV exports, Markdown summaries, customizable layouts).
+- **Why deferred**: v2's CLI ships with two formats — text and JSON — produced by short Python functions (~30 lines each). Jinja2 would add a dependency, a templates directory, and a template-loading layer for marginal value at this scale. Python functions are cheaper and easier to reason about for two output formats.
+- **Trigger to revisit**: When a third format is needed (HTML for sharing with non-technical stakeholders is the most likely), OR when users want to customize the layout per deployment. At that point, migrate `render_text` and `render_json` to load `text.j2` and `json.j2` templates respectively, and add new formats as new templates.
+
+### PyPI distribution / workspace model
+
+- **What**: dataprism currently assumes a self-contained project layout (clone the repo, use it in place). The audit log lives at `<project-root>/audit/`; the code finds the project root by walking up from `__file__`. This works fine for developing dataprism on your own machine, but fails if someone `pip install`s dataprism (then `__file__` is in `site-packages/`, and there's no project root).
+- **Why deferred**: dataprism is currently a personal tool; PyPI distribution is not a target. Adding workspace concepts (init command, marker files, walk-up-from-CWD discovery) adds complexity for a use case we don't have. Better to ship the simple model and revisit if the distribution story changes.
+- **Trigger to revisit**: When dataprism is being prepared for PyPI distribution OR when a user needs to use dataprism without cloning the repo. At that point, redesign needed: workspace marker file, `dataprism init` command, CWD-based path resolution.
 
 ### Multi-writer audit
 
@@ -955,9 +1102,9 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 
 ### Test helper consolidation
 
-- **What**: Test helpers like `_make_engine`, `_dict_rule`, `_regex_rule` are duplicated between `tests/classification/test_engine.py` and `tests/classification/test_table.py`. The database-setup helper `make_users_db` is also duplicated between `tests/adapters/fixtures.py` and `tests/classification/test_table.py`. Combined duplication is around 60 lines.
-- **Why deferred**: When `test_table.py` was added in PR 9, extracting shared helpers would have required restructuring the `tests/` directory (adding `tests/__init__.py` to enable cross-subpackage imports, or creating a `tests/classification/fixtures.py` module). Both broaden PR 9's scope. The existing pattern is "fixtures live inside the subpackage that uses them"; the PR 9 deviation is to copy what's needed locally and document the duplication.
-- **Trigger to revisit**: When (a) a third test subpackage needs the classification helpers, OR (b) the `test_engine.py` and `test_table.py` copies diverge, OR (c) a more ambitious test-infrastructure refactor is undertaken (e.g., adding `tests/__init__.py`). At that point, extract shared helpers to `tests/classification/fixtures.py` and update both files to import from there.
+- **What**: Test helpers like `_make_engine`, `_dict_rule`, `_regex_rule` are duplicated between `tests/classification/test_engine.py` and `tests/classification/test_table.py`. The database-setup helper for `users` tables is duplicated across three locations: `tests/adapters/fixtures.py` (as `make_users_db`), `tests/classification/test_table.py` (as a local helper), and `tests/cli/test_main.py` (as `_make_users_db`). Combined duplication is around 80 lines.
+- **Why deferred**: When `test_table.py` was added in PR 9 and `test_main.py` in PR 10, extracting shared helpers would have required restructuring the `tests/` directory (adding `tests/__init__.py` to enable cross-subpackage imports, or creating a shared fixtures module). Both broaden each PR's scope. The existing pattern is "fixtures live inside the subpackage that uses them"; the deviation is to copy what's needed locally and document the duplication.
+- **Trigger to revisit**: When (a) a fourth test subpackage needs the same helpers, OR (b) the copies diverge, OR (c) a more ambitious test-infrastructure refactor is undertaken (e.g., adding `tests/__init__.py`). At that point, extract shared helpers to a shared fixtures module and update all consumers to import from there.
 
 ### General pattern: the YAGNI commitment
 
@@ -970,7 +1117,7 @@ The recurring theme in this section: dataprism v1 prioritizes correctness, clari
 The discipline of saying "not yet" repeatedly is what keeps the codebase reviewable. If you're considering reviving a deferred item, the question to ask is the trigger in the relevant bullet above. If the trigger has fired, build it. If it hasn't, save the complexity for later.
 
 
-## 9. Glossary
+## 10. Glossary
 
 Terms used throughout this document, with short definitions. dataprism-specific meanings only - general Python concepts are not defined here.
 
