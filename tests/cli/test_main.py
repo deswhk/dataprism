@@ -25,6 +25,20 @@ from dataprism.cli.main import app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def wide_terminal(monkeypatch):
+    """Force rich to render at a wide, fixed width in all tests.
+
+    rich (used by typer) detects terminal width and truncates help
+    output to fit. In CI environments (no TTY), the default width is
+    narrow and option names get truncated mid-word (e.g. '--table'
+    becomes '...'). Setting COLUMNS to a wide fixed value makes
+    rendering reproducible across local (Windows) and CI (Linux).
+    """
+    monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setenv("NO_COLOR", "1")
+
+
 # ---- Test helpers ---------------------------------------------------
 #
 # NOTE: _make_users_db duplicates make_users_db from tests/adapters/
