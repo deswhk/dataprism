@@ -11,12 +11,12 @@ Phase 1 complete. Phase 2 in progress.
 **Shipped:**
 - Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
 - Policy engine (YAML-driven rules validated against Pydantic schemas)
-- Classification (regex, dictionary, and statistical classifiers; high-level `classify_table` API)
+- Classification (regex, dictionary, statistical classifiers; `classify_table` for single tables, `classify_tables` for batches, `list_table_candidates` for cheap pre-scan discovery)
 - Database adapters (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
-- Command-line interface (`dataprism table classify`, `dataprism audit verify`)
+- Command-line interface (`dataprism table classify` with one-or-many `--table`, `dataprism table candidates`, `dataprism audit verify`)
 
 **In progress (v2):**
-- Report generation
+- HTML report generation
 
 **Deferred to later phases:**
 - Quality engine, encryption, retention pillars
@@ -61,6 +61,24 @@ Output is human-readable text by default. For machine-readable output, use `--ou
 
 ```powershell
 dataprism table classify --table users --policy example --output json
+```
+
+To classify several tables in one run, pass a comma-separated list. Output streams a progress line per table, with a summary at the end:
+
+```powershell
+dataprism table classify --table users,orders,customers --policy example
+```
+
+To discover which tables are worth scanning before committing to a list, use `table candidates`:
+
+```powershell
+dataprism table candidates --policy example
+```
+
+The output shows all tables sorted by how many columns match the policy's name-based rules. JSON output is also available for scripting:
+
+```powershell
+dataprism table candidates --policy example --output json
 ```
 
 Every classification appends to the audit log at `audit/audit.jsonl`. Verify the chain is intact:
