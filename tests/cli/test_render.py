@@ -13,9 +13,24 @@ from __future__ import annotations
 
 import json
 
+from dataprism.classification.candidates import TableCandidate
 from dataprism.classification.results import ClassificationResult
-from dataprism.classification.table import ColumnError, TableClassificationReport
-from dataprism.cli.render import render_json, render_text
+from dataprism.classification.table import (
+    ColumnError,
+    FailedTable,
+    ScanResult,
+    TableClassificationReport,
+)
+from dataprism.cli.render import (
+    render_candidates_json,
+    render_candidates_text,
+    render_json,
+    render_progress_complete_continuation,
+    render_progress_error_continuation,
+    render_progress_start,
+    render_scan_summary,
+    render_text,
+)
 
 # ---- Test helpers ---------------------------------------------------
 
@@ -73,6 +88,62 @@ def _make_empty_report() -> TableClassificationReport:
         matches_by_column={},
         errors=[],
     )
+
+
+def _make_clean_scan_result() -> ScanResult:
+    """A ScanResult with two successful tables, no failures."""
+    return ScanResult(
+        tables=[
+            TableClassificationReport(
+                table="users",
+                columns_attempted=3,
+                matches_by_column={
+                    "id": [],
+                    "email": [_make_result("email", rule_name="email_pattern")],
+                    "name": [],
+                },
+                errors=[],
+            ),
+            TableClassificationReport(
+                table="orders",
+                columns_attempted=2,
+                matches_by_column={"id": [], "total": []},
+                errors=[],
+            ),
+        ],
+        failed_tables=[],
+    )
+
+
+def _make_mixed_scan_result() -> ScanResult:
+    """A ScanResult with one success and one failure."""
+    return ScanResult(
+        tables=[
+            TableClassificationReport(
+                table="users",
+                columns_attempted=2,
+                matches_by_column={
+                    "email": [_make_result("email", rule_name="email_pattern")],
+                    "id": [],
+                },
+                errors=[],
+            ),
+        ],
+        failed_tables=[
+            FailedTable(name="ghost_table", error="Table not found"),
+        ],
+    )
+
+
+def _make_candidates() -> list[TableCandidate]:
+    """A sorted list of TableCandidate fixtures (sorted as engine would)."""
+    return [
+        TableCandidate(table="users", schema_name=None, column_count=5, match_count=3),
+        TableCandidate(table="customers", schema_name=None, column_count=6, match_count=2),
+        TableCandidate(table="orders", schema_name=None, column_count=8, match_count=1),
+        TableCandidate(table="audit_log", schema_name=None, column_count=4, match_count=0),
+        TableCandidate(table="config", schema_name=None, column_count=2, match_count=0),
+    ]
 
 
 # ---- Text renderer tests ---------------------------------------------
@@ -262,3 +333,235 @@ class TestRenderJson:
         assert parsed["columns_attempted"] == 0
         assert parsed["matches_by_column"] == {}
         assert parsed["errors"] == []
+
+
+# =====================================================================
+# Multi-table progress renderer tests
+# =====================================================================
+
+
+class TestRenderProgressStart:
+    """render_progress_start returns the line opener."""
+
+    def test_format(self):
+        """Format is 'Scanning <table>... ' with trailing space."""
+        assert render_progress_start("users") == "Scanning users... "
+
+    def test_no_trailing_newline(self):
+        """The opener has no newline (CLI uses nl=False)."""
+        assert "\n" not in render_progress_start("users")
+
+
+class TestRenderProgressCompleteContinuation:
+    """render_progress_complete_continuation appends after the opener."""
+
+    def test_format(self):
+        """Format is '<N> columns, <M> classifications'."""
+        report = _make_clean_report()
+        result = render_progress_complete_continuation(report)
+        assert result == "3 columns, 1 classifications"
+
+    def test_zero_classifications(self):
+        """Report with no matches shows 0 classifications."""
+        report = TableClassificationReport(
+            table="x",
+            columns_attempted=4,
+            matches_by_column={"a": [], "b": [], "c": [], "d": []},
+            errors=[],
+        )
+        assert render_progress_complete_continuation(report) == "4 columns, 0 classifications"
+
+    def test_classifications_count_columns_not_rules(self):
+        """A column matched by two rules counts as ONE classification."""
+        report = TableClassificationReport(
+            table="x",
+            columns_attempted=1,
+            matches_by_column={
+                "email": [
+                    _make_result("email", rule_name="rule_a"),
+                    _make_result("email", rule_name="rule_b"),
+                ],
+            },
+            errors=[],
+        )
+        assert render_progress_complete_continuation(report) == "1 columns, 1 classifications"
+
+
+class TestRenderProgressErrorContinuation:
+    """render_progress_error_continuation appends an error message."""
+
+    def test_format(self):
+        """Format is 'ERROR (<error>)'."""
+        assert render_progress_error_continuation("Table not found") == "ERROR (Table not found)"
+
+
+# =====================================================================
+# Multi-table summary renderer tests
+# =====================================================================
+
+
+class TestRenderScanSummary:
+    """render_scan_summary formats the post-scan summary line."""
+
+    def test_clean_run_omits_succeeded_failed(self):
+        """A clean run has no '(X succeeded, Y failed)' parenthetical."""
+        result = render_scan_summary(_make_clean_scan_result())
+        assert "succeeded" not in result
+        assert "failed" not in result
+
+    def test_clean_run_includes_table_count(self):
+        """Total tables count is shown."""
+        result = render_scan_summary(_make_clean_scan_result())
+        assert "2 tables" in result
+
+    def test_clean_run_includes_classification_count(self):
+        """Total classifications across all tables shown."""
+        result = render_scan_summary(_make_clean_scan_result())
+        # users has 1 classified column (email); orders has none
+        assert "1 classifications total" in result
+
+    def test_mixed_run_shows_succeeded_and_failed(self):
+        """A mixed run shows succeeded/failed parenthetical."""
+        result = render_scan_summary(_make_mixed_scan_result())
+        assert "succeeded" in result
+        assert "failed" in result
+        assert "2 tables" in result  # 1 success + 1 failure
+        assert "1 succeeded" in result
+        assert "1 failed" in result
+
+    def test_empty_scan_summary(self):
+        """An empty ScanResult summarizes to '0 tables' and 0 classifications."""
+        empty = ScanResult(tables=[], failed_tables=[])
+        result = render_scan_summary(empty)
+        assert "0 tables" in result
+        assert "0 classifications" in result
+
+
+# =====================================================================
+# Candidates text renderer tests
+# =====================================================================
+
+
+class TestRenderCandidatesText:
+    """render_candidates_text produces aligned text."""
+
+    def test_header_with_schema(self):
+        """Header reads 'Tables in '<schema>' (<N>):' when schema given."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates, schema="public")
+        assert "Tables in 'public' (5):" in result
+
+    def test_header_without_schema(self):
+        """Header reads 'Tables in database (<N>):' when schema is None."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates, schema=None)
+        assert "Tables in database (5):" in result
+
+    def test_includes_all_table_names(self):
+        """Every input candidate appears in output."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates)
+        for c in candidates:
+            assert c.table in result
+
+    def test_includes_match_counts(self):
+        """Each line shows the candidate's match_count."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates)
+        # "3 matching" for users (top match count)
+        assert "3 matching" in result
+
+    def test_includes_column_counts(self):
+        """Each line shows the candidate's column_count."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates)
+        # users has 5 cols
+        assert "5 cols" in result
+
+    def test_caveat_present(self):
+        """The 'column-name rules only' caveat is at the bottom."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates)
+        assert "column-name rules only" in result
+        assert "classify to be sure" in result
+
+    def test_empty_list_still_shows_caveat(self):
+        """Empty input shows header and caveat, no table rows."""
+        result = render_candidates_text([], schema="public")
+        assert "Tables in 'public' (0):" in result
+        assert "column-name rules only" in result
+
+    def test_preserves_engine_sort_order(self):
+        """Output order matches input order (engine sorts before render)."""
+        candidates = _make_candidates()
+        result = render_candidates_text(candidates)
+        # users (3 matches) should appear before customers (2 matches)
+        users_pos = result.index("users")
+        customers_pos = result.index("customers")
+        assert users_pos < customers_pos
+
+
+# =====================================================================
+# Candidates JSON renderer tests
+# =====================================================================
+
+
+class TestRenderCandidatesJson:
+    """render_candidates_json produces parseable JSON."""
+
+    def test_output_is_valid_json(self):
+        """Output parses as JSON."""
+        result = render_candidates_json(_make_candidates())
+        parsed = json.loads(result)
+        assert isinstance(parsed, dict)
+
+    def test_has_top_level_keys(self):
+        """JSON has schema, total_tables, tables top-level keys."""
+        result = render_candidates_json(_make_candidates(), schema="public")
+        parsed = json.loads(result)
+        assert "schema" in parsed
+        assert "total_tables" in parsed
+        assert "tables" in parsed
+
+    def test_total_tables_matches_count(self):
+        """total_tables equals the candidate count."""
+        result = render_candidates_json(_make_candidates())
+        parsed = json.loads(result)
+        assert parsed["total_tables"] == 5
+
+    def test_schema_field_echoes_input(self):
+        """The schema parameter is echoed in the output."""
+        result = render_candidates_json(_make_candidates(), schema="public")
+        parsed = json.loads(result)
+        assert parsed["schema"] == "public"
+
+    def test_schema_field_is_null_for_none(self):
+        """schema=None becomes null in JSON."""
+        result = render_candidates_json(_make_candidates(), schema=None)
+        parsed = json.loads(result)
+        assert parsed["schema"] is None
+
+    def test_tables_array_preserves_order(self):
+        """tables list preserves engine sort order."""
+        result = render_candidates_json(_make_candidates())
+        parsed = json.loads(result)
+        names = [t["table"] for t in parsed["tables"]]
+        # First entry should be 'users' (highest match count)
+        assert names[0] == "users"
+
+    def test_table_record_has_all_fields(self):
+        """Each table dict contains all TableCandidate fields."""
+        result = render_candidates_json(_make_candidates())
+        parsed = json.loads(result)
+        first = parsed["tables"][0]
+        assert "table" in first
+        assert "schema_name" in first
+        assert "column_count" in first
+        assert "match_count" in first
+
+    def test_empty_candidates_produces_valid_json(self):
+        """Empty list produces a structurally complete document."""
+        result = render_candidates_json([])
+        parsed = json.loads(result)
+        assert parsed["total_tables"] == 0
+        assert parsed["tables"] == []

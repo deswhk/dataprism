@@ -31,6 +31,8 @@ class EventType(StrEnum):
     CLASSIFICATION_FAILED = "classification_failed"
     TABLE_CLASSIFICATION_STARTED = "table_classification_started"
     TABLE_CLASSIFICATION_COMPLETED = "table_classification_completed"
+    SCAN_STARTED = "scan_started"
+    SCAN_COMPLETED = "scan_completed"
     QUALITY_CHECK_RUN = "quality_check_run"
     QUALITY_CHECK_FAILED = "quality_check_failed"
 

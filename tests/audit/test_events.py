@@ -26,6 +26,11 @@ class TestEventType:
         assert EventType.CLASSIFICATION_FAILED in error_types
         assert EventType.POLICY_LOADED not in error_types
 
+    def test_scan_event_types_exist(self):
+        """SCAN_STARTED and SCAN_COMPLETED are the multi-table bookend pair."""
+        assert EventType.SCAN_STARTED == "scan_started"
+        assert EventType.SCAN_COMPLETED == "scan_completed"
+
 
 class TestAuditEventConstruction:
     """An AuditEvent can be constructed with minimal required fields."""

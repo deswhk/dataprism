@@ -119,12 +119,19 @@ class SqliteAdapter:
         """List all tables in the database.
 
         SQLite doesn't have real schemas. The `schema` parameter is
-        accepted for protocol consistency but ignored.
+        accepted for protocol consistency but ignored - we always
+        call SQLAlchemy's get_table_names() with schema=None.
+
+        Earlier versions passed the parameter through, which caused
+        AdapterQueryError when callers passed any non-default value
+        (SQLAlchemy interpreted it as a SQLite ATTACH DATABASE name).
         """
         self._require_connected()
         inspector = inspect(self._engine)
         try:
-            names = inspector.get_table_names(schema=schema)
+            # Always pass schema=None - SQLite has no schema concept,
+            # and SQLAlchemy interprets non-None values as ATTACH names.
+            names = inspector.get_table_names(schema=None)
         except Exception as e:
             raise AdapterQueryError(f"Could not list tables: {e}") from e
         return [TableInfo(name=name, schema_name=None) for name in names]

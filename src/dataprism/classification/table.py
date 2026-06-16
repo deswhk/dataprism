@@ -1,24 +1,24 @@
-"""High-level classify_table API.
+"""High-level classification APIs.
 
-Combines a DatabaseAdapter, a ClassificationPolicy, and an AuditService
-into a single function that classifies every column in a table. This is
-the function callers reach for when they want "classify this table"
-without writing the per-column iteration boilerplate themselves.
+This module exposes two table-level classification functions:
 
-The function:
-- Takes an already-connected adapter (caller manages connection lifecycle)
-- Emits TABLE_CLASSIFICATION_STARTED at start of run
-- Iterates columns, sampling and classifying each
-- Records per-column errors without aborting the whole run
-- Emits TABLE_CLASSIFICATION_COMPLETED at end
-- Returns a TableClassificationReport with matches and errors
+- classify_table: classify every column in ONE table. Returns a
+  TableClassificationReport.
 
-For per-column custom sampling or filtering, callers should use the
-lower-level adapter + engine APIs directly.
+- classify_tables: classify every column across MANY tables, with
+  per-table failure isolation. Returns a ScanResult containing the
+  per-table reports plus any per-table failures.
+
+Both combine a DatabaseAdapter, a ClassificationPolicy, and an
+AuditService into a single function call. Lower-level uses (custom
+sampling, partial column iteration) should use the adapter + engine
+APIs directly.
 """
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
@@ -171,3 +171,171 @@ def classify_table(
         matches_by_column=matches_by_column,
         errors=errors,
     )
+
+
+class FailedTable(BaseModel):
+    """Records that an entire table could not be classified.
+
+    Distinct from ColumnError, which records per-column failures
+    inside a TableClassificationReport. A FailedTable means
+    classify_table itself raised - typically because the table
+    doesn't exist, permission was denied, or the adapter couldn't
+    list its columns.
+
+    Attributes:
+        name: Name of the table that failed (as the user specified it).
+        error: Human-readable description of what went wrong.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str
+    error: str
+
+
+class ScanResult(BaseModel):
+    """The result of classify_tables.
+
+    Aggregates per-table results plus any per-table failures from
+    a multi-table classification run.
+
+    Attributes:
+        tables: List of TableClassificationReport, one per
+            successfully-classified table. Empty if all tables failed.
+        failed_tables: List of FailedTable records, one per table
+            that could not be classified at all. Empty if all
+            tables succeeded.
+
+    Consistency invariant:
+        len(tables) + len(failed_tables) == number of unique input tables
+
+    Note that per-column failures within a successfully-classified
+    table appear in that table's TableClassificationReport.errors,
+    not here. failed_tables is for whole-table failures only.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tables: list[TableClassificationReport]
+    failed_tables: list[FailedTable]
+
+
+def classify_tables(
+    adapter: DatabaseAdapter,
+    tables: list[str],
+    policy: ClassificationPolicy,
+    audit: AuditService,
+    *,
+    policy_name: str | None = None,
+    sample_size: int = 1000,
+    strategy: SamplingStrategy = SamplingStrategy.SEQUENTIAL,
+    actor: str = "classify_tables",
+    on_table_start: Callable[[str], None] | None = None,
+    on_table_complete: Callable[[str, TableClassificationReport], None] | None = None,
+    on_table_failed: Callable[[str, str], None] | None = None,
+) -> ScanResult:
+    """Classify every column across multiple tables.
+
+    Iterates over the given table names, calling classify_table for
+    each. Per-table failures are caught and collected in the
+    returned ScanResult's failed_tables list; the scan continues
+    with the next table. The audit trail includes SCAN_STARTED and
+    SCAN_COMPLETED bookend events with a shared scan_id, plus the
+    per-table events emitted by classify_table.
+
+    Args:
+        adapter: A connected DatabaseAdapter.
+        tables: List of table names to classify. Duplicates are NOT
+            deduped here - callers must dedupe before passing.
+        policy: The classification policy to apply.
+        audit: AuditService for recording events.
+        policy_name: Optional name of the policy (e.g. "example"),
+            recorded on SCAN_STARTED for audit traceability. The
+            policy model itself doesn't carry its filename; the
+            caller (typically the CLI) knows it.
+        sample_size: Maximum number of values to sample per column.
+        strategy: How to sample values. Default SEQUENTIAL.
+        actor: Actor name recorded on audit events. Default
+            "classify_tables".
+        on_table_start: Optional callback invoked before each table's
+            classification begins. Receives the table name. Use for
+            progress UI; do not raise from this callback (the engine
+            does not catch).
+        on_table_complete: Optional callback invoked after a table
+            is successfully classified. Receives the table name and
+            its TableClassificationReport.
+        on_table_failed: Optional callback invoked when a table's
+            classification fails (i.e., classify_table raised
+            AdapterError). Receives the table name and the error
+            message string.
+
+    Returns:
+        A ScanResult with per-table reports and per-table failures.
+
+    Raises:
+        Does not raise for per-table failures (those go in
+        failed_tables). Adapter errors specific to one table are
+        caught; other exceptions propagate.
+    """
+    scan_id = str(uuid.uuid4())
+    table_count = len(tables)
+
+    # SCAN_STARTED bookend. policy_name only included if provided.
+    start_data: dict[str, object] = {
+        "scan_id": scan_id,
+        "table_count": table_count,
+    }
+    if policy_name is not None:
+        start_data["policy_name"] = policy_name
+    audit.record(
+        event_type=EventType.SCAN_STARTED,
+        actor=actor,
+        data=start_data,
+    )
+
+    successful_reports: list[TableClassificationReport] = []
+    failed: list[FailedTable] = []
+
+    for table in tables:
+        if on_table_start is not None:
+            on_table_start(table)
+        try:
+            report = classify_table(
+                adapter,
+                table,
+                policy,
+                audit,
+                sample_size=sample_size,
+                strategy=strategy,
+                actor=actor,
+            )
+            successful_reports.append(report)
+            if on_table_complete is not None:
+                on_table_complete(table, report)
+        except AdapterError as e:
+            failed.append(FailedTable(name=table, error=str(e)))
+            if on_table_failed is not None:
+                on_table_failed(table, str(e))
+
+    # Total classifications = sum of columns with at least one match,
+    # across all successful tables. A column contributes 1 if it had
+    # any matching rule, 0 otherwise.
+    total_classifications = sum(
+        sum(1 for matches in report.matches_by_column.values() if matches)
+        for report in successful_reports
+    )
+
+    # SCAN_COMPLETED bookend.
+    audit.record(
+        event_type=EventType.SCAN_COMPLETED,
+        actor=actor,
+        data={
+            "scan_id": scan_id,
+            "table_count": table_count,
+            "success_count": len(successful_reports),
+            "failure_count": len(failed),
+            "total_classifications": total_classifications,
+        },
+    )
+
+    return ScanResult(tables=successful_reports, failed_tables=failed)

@@ -55,12 +55,12 @@ This is **v2** in progress (Phase 1 complete, Phase 2 in active development). Th
 **Shipped:**
 - Audit subsystem (append-only, hash-chained event log)
 - Policy subsystem (YAML schema + validation + audit integration)
-- Classification subsystem (regex, dictionary, statistical rule evaluators, plus high-level `classify_table` API)
+- Classification subsystem (regex, dictionary, statistical rule evaluators; `classify_table` for single tables; `classify_tables` for batch scans with SCAN_STARTED/SCAN_COMPLETED audit bookends; `list_table_candidates` for cheap pre-scan discovery)
 - Adapters subsystem (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
-- CLI subsystem (`dataprism table classify`, `dataprism audit verify`)
+- CLI subsystem (`dataprism table classify` with comma-separated `--table`; `dataprism table candidates`; `dataprism audit verify`)
 
 **In progress (v2):**
-- Report generation (richer text + JSON output, possibly HTML)
+- HTML report generation (Jinja2-rendered scan reports; written alongside every classify run)
 
 **Deferred (Phase 3 and beyond):**
 - Quality engine pillar
@@ -494,10 +494,12 @@ Package: `dataprism.classification`
 
 ### Purpose
 
-Apply policy rules to columns and return matches. The subsystem exposes two APIs at different abstraction levels:
+Apply policy rules to columns and return matches. The subsystem exposes APIs at four abstraction levels:
 
 - **`ClassificationEngine.classify(column_name, values)`** - the per-column workhorse. Given a loaded `ClassificationPolicy` and a column (its name plus optional sample values), the engine evaluates every rule and returns one `ClassificationResult` per match. Every call records a `CLASSIFICATION_RUN` audit event.
-- **`classify_table(adapter, table, policy, audit)`** - the table-level convenience. Combines a `DatabaseAdapter` with the engine to classify every column in one call. Emits `TABLE_CLASSIFICATION_STARTED`/`TABLE_CLASSIFICATION_COMPLETED` events around the per-column work, collects per-column errors in a `TableClassificationReport`, and returns the full picture.
+- **`classify_table(adapter, table, policy, audit)`** - the single-table convenience. Combines a `DatabaseAdapter` with the engine to classify every column in one call. Emits `TABLE_CLASSIFICATION_STARTED`/`TABLE_CLASSIFICATION_COMPLETED` events around the per-column work, collects per-column errors in a `TableClassificationReport`, and returns the full picture.
+- **`classify_tables(adapter, tables, policy, audit)`** - the multi-table sibling. Loops over `classify_table` for each input, catching per-table failures into a `failed_tables` list rather than aborting the run. Emits `SCAN_STARTED`/`SCAN_COMPLETED` bookend events with a shared `scan_id` so the audit log can cross-reference all activity from one batch invocation. Returns a `ScanResult` (the per-table reports + failures). Accepts optional progress callbacks (`on_table_start`, `on_table_complete`, `on_table_failed`) so callers (like the CLI) can stream incremental output without the engine needing to know about stdout.
+- **`list_table_candidates(adapter, policy, schema=None)`** - the pre-scan discovery API. Walks every table in scope and counts how many columns match the policy's *name-based* rules (regex with `target=column_name`; dictionary). Statistical and value-target rules are deliberately skipped (they would require sampling, defeating the point of a cheap pre-scan). Returns a list of `TableCandidate`, sorted by match count descending then name ascending, so the user sees likely scan targets first. Output is a heuristic, not a guarantee: a 0-match table may still contain sensitive data in oddly-named columns.
 
 This is the first subsystem that *does* something with data, as opposed to defining or storing rules. Audit is the substrate and policy is the language; classification is the first real application.
 
@@ -882,7 +884,7 @@ Hand-writing `ORDER BY random()` would work on SQLite and Postgres but fail on M
 
 ### Purpose
 
-Provide a command-line interface that exposes dataprism's programmatic API to users who want to run classification and audit operations from a terminal without writing Python. The CLI is a thin wiring layer over the subsystems below it - it takes shell input, resolves paths, selects adapters, calls into `classify_table` and audit storage, and renders results. No business logic lives in the CLI itself.
+Provide a command-line interface that exposes dataprism's programmatic API to users who want to run classification and audit operations from a terminal without writing Python. The CLI is a thin wiring layer over the subsystems below it - it takes shell input, resolves paths, selects adapters, calls into `classify_table` / `classify_tables` / `list_table_candidates` / audit storage, and renders results. No business logic lives in the CLI itself.
 
 ### Key design decisions
 
@@ -902,10 +904,28 @@ Commands are grouped by what they operate on, not by verb:
 
 ```
 dataprism table classify ...
+dataprism table candidates ...
 dataprism audit verify
 ```
 
-Not flat (`dataprism classify`, `dataprism verify`). The nested form makes domain boundaries explicit and scales when we add more verbs (`dataprism table inspect`, `dataprism policy list`, etc.). The cost is one extra word per invocation; the benefit is structure that mirrors the subsystems.
+Not flat (`dataprism classify`, `dataprism verify`). The nested form makes domain boundaries explicit and scales when we add more verbs (`dataprism policy list`, future `dataprism table inspect`). The cost is one extra word per invocation; the benefit is structure that mirrors the subsystems.
+
+**One `--table` flag, one or many tables**
+
+`dataprism table classify --table NAMES` accepts a single table name or a comma-separated list. The CLI parses the value into a deduplicated list (preserving first-occurrence order via `dict.fromkeys`), then branches:
+
+- *Single table* (after dedupe): uses `classify_table`. Output is the detailed per-column text or JSON from PR 10 - unchanged for backward compatibility.
+- *Multiple tables*: uses `classify_tables`. Output is one progress line per table (streamed via the engine's callbacks) plus a final summary line.
+
+The alternative would have been to introduce a plural `tables` command group (`dataprism tables classify --tables ...`). Rejected because the singular/plural distinction is invisible to users and creates two commands that do the same thing. One flag, one command, smart parsing.
+
+**Pre-scan candidate listing**
+
+`dataprism table candidates --policy NAME [--schema NAME] [--output text|json]` walks every table in scope and reports how many columns match the policy's name-based rules. It's a *cheap* command: no data sampling, no audit events, no HTML report - just a quick "what should I scan?" lookup.
+
+Statistical and value-target regex rules are deliberately skipped because evaluating them would require sampling data, which defeats the purpose. The output includes an explicit caveat that 0-match tables may still contain sensitive data; classify to verify.
+
+The text format is for terminal reading; the JSON format is for scripting workflows (e.g., extract names of tables with matches, pipe back into `classify --table`).
 
 **Env-var-only DSN; explicit policy and output flags**
 
@@ -965,14 +985,16 @@ src/dataprism/cli/
 +-- main.py        # Typer app and command implementations
 +-- paths.py       # get_project_root, get_audit_log_path, get_policy_path
 +-- adapters.py    # normalize_dsn, select_adapter
-+-- render.py      # render_text, render_json
++-- render.py      # render_text/render_json (single-table);
+                   # render_progress_* + render_scan_summary (multi-table);
+                   # render_candidates_text/render_candidates_json
 ```
 
 Each module has one job:
 
 - `paths`: filesystem concerns (project root discovery, audit log path, policy name resolution)
 - `adapters`: DSN handling (normalization, adapter class selection)
-- `render`: output formatting (text and JSON)
+- `render`: output formatting (single-table text/JSON, multi-table progress + summary, candidates text/JSON)
 - `main`: Typer wiring (commands, argument parsing, error handling, end-to-end orchestration)
 
 ### Internals worth understanding
@@ -1006,7 +1028,8 @@ In JSON mode, only the JSON document goes to stdout - no "Audit log: ..." traile
 - **Self-contained project model only**: dataprism cannot be `pip install`ed yet. Source must be cloned. The path-resolution approach (walk up from `__file__`) breaks in `site-packages/`. See deferred decisions for the workspace model.
 - **Two output formats**: text and JSON. Adding more (HTML, Markdown, CSV) would benefit from a template engine; deferred.
 - **No CLI config file**: each invocation reads its own env vars and flags. If a user wants the same `--policy` for many commands, they retype it. Deferred until friction is observed.
-- **Per-table operation only**: `dataprism table classify --table users` operates on one table at a time. A future `dataprism schema classify --schema public` for batch operation would build on the same primitives.
+- **No HTML report yet**: every `classify` run could produce a persistent artifact for governance review. Currently the user gets terminal output only. HTML report generation is the focus of PR 12.
+- **No schema-level batch operation**: `dataprism table classify --table T1,T2,T3` operates on a list the user specifies. `dataprism table candidates` helps the user discover what to put in that list, but there is no `--schema sales` shortcut that scans every table in a schema. Deliberate scope choice (see the "you specify what to scan" framing in section 1) - revisit if usage patterns suggest otherwise.
 - **No completion auto-generated for the user**: Typer supports shell completion via `--install-completion`, but dataprism doesn't promote this in docs or README. It works, but as an advanced feature.
 
 
@@ -1039,6 +1062,12 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 - **What**: MySQL, MSSQL, Oracle adapter implementations. v2 ships `SqliteAdapter` (test backend) and `PostgresAdapter` (production target). The remaining backends are deferred.
 - **Why deferred**: Each adapter is ~150 lines following the established pattern, but each adds its own integration testing burden (test database, dialect-specific edge cases). The Protocol is validated against two backends now (SQLite + PostgreSQL); adding more is on demand.
 - **Trigger to revisit**: When a real-world workload needs one of the deferred backends. Adding an adapter is non-breaking - it's a new class satisfying the existing Protocol.
+
+### Multi-schema discovery (`list_schemas()`)
+
+- **What**: A `DatabaseAdapter.list_schemas()` method that returns user-visible schemas (excluding system schemas like `pg_catalog`, `information_schema`). The CLI's `table candidates` and `table classify` could then offer a `--all-schemas` mode that iterates across schemas instead of requiring the user to pass `--schema NAME` repeatedly.
+- **Why deferred**: Each adapter needs to know which schemas are "system" - PostgresAdapter needs to exclude `pg_catalog`, `information_schema`, and a few others; future Oracle adapter would need to exclude `SYS`, `SYSTEM`, etc.; MSSQL has its own list. That per-adapter knowledge is real work and adds an integration-testing burden for each backend. PR 11's framing settled on "the user specifies what to scan" - a name-by-name list (`--table T1,T2,T3`) is enough for the active use case. Discovery across schemas is a separate need we don't have yet.
+- **Trigger to revisit**: When a user has tables in non-default schemas (Postgres schemas other than `public`) and finds running `--schema X` per schema to be friction. At that point, add `list_schemas()` to the Protocol, implement it for each adapter (with system-schema exclusion lists), and offer the CLI a `--all-schemas` flag that iterates.
 
 ### CLI config file for shared settings
 
@@ -1102,9 +1131,9 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 
 ### Test helper consolidation
 
-- **What**: Test helpers like `_make_engine`, `_dict_rule`, `_regex_rule` are duplicated between `tests/classification/test_engine.py` and `tests/classification/test_table.py`. The database-setup helper for `users` tables is duplicated across three locations: `tests/adapters/fixtures.py` (as `make_users_db`), `tests/classification/test_table.py` (as a local helper), and `tests/cli/test_main.py` (as `_make_users_db`). Combined duplication is around 80 lines.
-- **Why deferred**: When `test_table.py` was added in PR 9 and `test_main.py` in PR 10, extracting shared helpers would have required restructuring the `tests/` directory (adding `tests/__init__.py` to enable cross-subpackage imports, or creating a shared fixtures module). Both broaden each PR's scope. The existing pattern is "fixtures live inside the subpackage that uses them"; the deviation is to copy what's needed locally and document the duplication.
-- **Trigger to revisit**: When (a) a fourth test subpackage needs the same helpers, OR (b) the copies diverge, OR (c) a more ambitious test-infrastructure refactor is undertaken (e.g., adding `tests/__init__.py`). At that point, extract shared helpers to a shared fixtures module and update all consumers to import from there.
+- **What**: Test helpers like `_dict_rule`, `_regex_rule`, and the `users`-database fixture are duplicated across multiple test files. After PR 11, the duplication spans `tests/classification/test_engine.py`, `tests/classification/test_table.py` (which also has a multi-table fixture), `tests/classification/test_candidates.py` (added in PR 11), and `tests/cli/test_main.py` (which has both single- and multi-table CLI fixtures). Combined duplication is now over 150 lines.
+- **Why deferred**: Each new test file added the local copies it needed rather than reach across subpackages. `pytest` subpackages don't share fixtures by default (no `tests/__init__.py`). Extracting shared helpers would require either restructuring the tests directory or creating a top-level `tests/conftest.py` with the helpers as fixtures. Both broaden the PR that does it. PR 11 doubled the duplication without resolving it - making the deferral cost more visible.
+- **Trigger to revisit**: The original trigger ((a) "fourth test subpackage needs the same helpers") **has fired** as of PR 11 (`test_candidates.py` is the fourth). The deferral now persists deliberately because PR 11's scope is multi-table classify, not test-infra refactor. A dedicated cleanup PR after PR 12 is the right home for this work. The work itself: extract helpers into `tests/conftest.py` (project-wide), update existing tests to use the fixtures via dependency injection, remove the local copies.
 
 ### General pattern: the YAGNI commitment
 
