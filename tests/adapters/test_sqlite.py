@@ -149,13 +149,28 @@ class TestListTables:
             adapter.close()
 
     def test_schema_argument_ignored_for_sqlite(self, tmp_path):
-        """SQLite has no real schemas; the parameter is accepted but ignored."""
+        """SQLite has no real schemas; the parameter is accepted but ignored.
+
+        Earlier versions passed the parameter through to SQLAlchemy, which
+        interpreted any non-default value as a SQLite ATTACH DATABASE name
+        and raised. This test ensures that contract is preserved: passing
+        any string for schema yields the same result as passing None.
+        """
         dsn = make_minimal_db(tmp_path / "test.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            tables = adapter.list_tables(schema=None)
-            assert len(tables) == 1
+            # Baseline: default behavior
+            baseline = adapter.list_tables(schema=None)
+            assert len(baseline) == 1
+
+            # Same result with an explicit (but meaningless) schema name
+            with_schema = adapter.list_tables(schema="nonexistent")
+            assert with_schema == baseline
+
+            # And with a name that happens to match a Postgres convention
+            with_public = adapter.list_tables(schema="public")
+            assert with_public == baseline
         finally:
             adapter.close()
 

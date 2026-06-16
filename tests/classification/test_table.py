@@ -30,8 +30,11 @@ from dataprism.audit.events import EventType
 from dataprism.audit.service import AuditService
 from dataprism.audit.storage import InMemoryStorage
 from dataprism.classification.table import (
+    FailedTable,
+    ScanResult,
     TableClassificationReport,
     classify_table,
+    classify_tables,
 )
 from dataprism.policy.models import (
     ClassificationLabel,
@@ -130,6 +133,52 @@ def _make_users_db(tmp_path) -> str:
                 text("INSERT INTO users VALUES (4, 'diana@example.com', 'Diana', 1, 92.0)")
             )
             conn.execute(text("INSERT INTO users VALUES (5, 'eve@example.com', 'Eve', 0, 50.5)"))
+    finally:
+        engine.dispose()
+    return dsn
+
+
+def _make_multi_table_db(tmp_path) -> str:
+    """Create a SQLite database with multiple tables for multi-table tests.
+
+    Schema:
+        users (id, email, name, active, score)         - 5 rows
+        orders (id, customer_id, total)                - 3 rows
+        products (id, sku, name, price)                - 3 rows
+    """
+    from sqlalchemy import create_engine, text
+
+    dsn = f"sqlite:///{tmp_path / 'multi.db'}"
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            # users
+            conn.execute(
+                text(
+                    "CREATE TABLE users ("
+                    "id INTEGER, email TEXT, name TEXT, "
+                    "active INTEGER, score REAL)"
+                )
+            )
+            conn.execute(text("INSERT INTO users VALUES (1, 'a@example.com', 'Alice', 1, 99.5)"))
+            conn.execute(text("INSERT INTO users VALUES (2, 'b@example.com', 'Bob', 1, 88.0)"))
+            conn.execute(text("INSERT INTO users VALUES (3, 'c@example.com', 'Carol', 1, 77.5)"))
+            conn.execute(text("INSERT INTO users VALUES (4, 'd@example.com', 'Dan', 0, 66.0)"))
+            conn.execute(text("INSERT INTO users VALUES (5, 'e@example.com', 'Eve', 1, 55.5)"))
+
+            # orders
+            conn.execute(text("CREATE TABLE orders (id INTEGER, customer_id INTEGER, total REAL)"))
+            conn.execute(text("INSERT INTO orders VALUES (1, 1, 49.99)"))
+            conn.execute(text("INSERT INTO orders VALUES (2, 2, 19.50)"))
+            conn.execute(text("INSERT INTO orders VALUES (3, 3, 75.00)"))
+
+            # products
+            conn.execute(
+                text("CREATE TABLE products (id INTEGER, sku TEXT, name TEXT, price REAL)")
+            )
+            conn.execute(text("INSERT INTO products VALUES (1, 'A-001', 'Widget', 9.99)"))
+            conn.execute(text("INSERT INTO products VALUES (2, 'A-002', 'Gadget', 19.99)"))
+            conn.execute(text("INSERT INTO products VALUES (3, 'A-003', 'Sprocket', 4.49)"))
     finally:
         engine.dispose()
     return dsn
@@ -644,3 +693,340 @@ class TestSamplingParameters:
 
         assert captured[0]["n"] == 42
         assert captured[0]["strategy"] == SamplingStrategy.RANDOM
+
+
+# =====================================================================
+# Tests for classify_tables
+# =====================================================================
+
+
+class TestClassifyTablesHappyPath:
+    """Multi-table classify_tables happy path - all tables succeed."""
+
+    def test_returns_scan_result(self, tmp_path):
+        """classify_tables returns a ScanResult."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
+            assert isinstance(result, ScanResult)
+        finally:
+            adapter.close()
+
+    def test_tables_list_has_one_report_per_input(self, tmp_path):
+        """All three input tables produce a TableClassificationReport."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
+            assert len(result.tables) == 3
+            table_names = {r.table for r in result.tables}
+            assert table_names == {"users", "orders", "products"}
+        finally:
+            adapter.close()
+
+    def test_no_failures_on_clean_run(self, tmp_path):
+        """failed_tables is empty when all tables succeed."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
+            assert result.failed_tables == []
+        finally:
+            adapter.close()
+
+    def test_each_report_carries_its_table_name(self, tmp_path):
+        """Each TableClassificationReport's `table` field matches input."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "orders"], policy, audit)
+            # Order is not guaranteed by the function's contract, but
+            # the names should round-trip.
+            names = [r.table for r in result.tables]
+            assert sorted(names) == ["orders", "users"]
+        finally:
+            adapter.close()
+
+    def test_only_matching_table_finds_classification(self, tmp_path):
+        """A policy targeting only 'email' classifies only the users table."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
+
+            # Find each report by name
+            by_name = {r.table: r for r in result.tables}
+            users_matches = sum(
+                1 for matches in by_name["users"].matches_by_column.values() if matches
+            )
+            orders_matches = sum(
+                1 for matches in by_name["orders"].matches_by_column.values() if matches
+            )
+            assert users_matches == 1  # email column
+            assert orders_matches == 0
+        finally:
+            adapter.close()
+
+
+class TestClassifyTablesAuditEvents:
+    """SCAN_STARTED and SCAN_COMPLETED bookend events."""
+
+    def test_emits_scan_started_event(self, tmp_path):
+        """A SCAN_STARTED event is recorded."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users", "orders"], policy, audit)
+            event_types = [e.event_type for e in storage.read_all()]
+            assert EventType.SCAN_STARTED in event_types
+        finally:
+            adapter.close()
+
+    def test_emits_scan_completed_event(self, tmp_path):
+        """A SCAN_COMPLETED event is recorded."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users", "orders"], policy, audit)
+            event_types = [e.event_type for e in storage.read_all()]
+            assert EventType.SCAN_COMPLETED in event_types
+        finally:
+            adapter.close()
+
+    def test_scan_bookends_have_shared_scan_id(self, tmp_path):
+        """SCAN_STARTED and SCAN_COMPLETED carry the same scan_id."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users"], policy, audit)
+
+            events = list(storage.read_all())
+            started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
+            completed = next(e for e in events if e.event_type == EventType.SCAN_COMPLETED)
+            assert started.data["scan_id"] == completed.data["scan_id"]
+        finally:
+            adapter.close()
+
+    def test_scan_started_records_table_count(self, tmp_path):
+        """SCAN_STARTED data includes the input table count."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users", "orders", "products"], policy, audit)
+            events = list(storage.read_all())
+            started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
+            assert started.data["table_count"] == 3
+        finally:
+            adapter.close()
+
+    def test_scan_completed_records_success_and_failure_counts(self, tmp_path):
+        """SCAN_COMPLETED records success_count, failure_count, total_classifications."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users", "orders"], policy, audit)
+
+            events = list(storage.read_all())
+            completed = next(e for e in events if e.event_type == EventType.SCAN_COMPLETED)
+            assert completed.data["success_count"] == 2
+            assert completed.data["failure_count"] == 0
+            assert completed.data["total_classifications"] == 1  # email in users
+
+        finally:
+            adapter.close()
+
+    def test_policy_name_propagates_when_provided(self, tmp_path):
+        """If policy_name is provided, SCAN_STARTED carries it."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users"], policy, audit, policy_name="example")
+            events = list(storage.read_all())
+            started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
+            assert started.data["policy_name"] == "example"
+        finally:
+            adapter.close()
+
+    def test_policy_name_omitted_when_not_provided(self, tmp_path):
+        """If policy_name is not provided, SCAN_STARTED data has no such key."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users"], policy, audit)
+            events = list(storage.read_all())
+            started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
+            assert "policy_name" not in started.data
+        finally:
+            adapter.close()
+
+    def test_default_actor_is_classify_tables(self, tmp_path):
+        """Without explicit actor, events have actor='classify_tables'."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            classify_tables(adapter, ["users"], policy, audit)
+            # The bookend events should have actor='classify_tables'.
+            events = list(storage.read_all())
+            scan_events = [
+                e
+                for e in events
+                if e.event_type in (EventType.SCAN_STARTED, EventType.SCAN_COMPLETED)
+            ]
+            actors = {e.actor for e in scan_events}
+            assert actors == {"classify_tables"}
+        finally:
+            adapter.close()
+
+
+class TestClassifyTablesErrorHandling:
+    """Per-table failures are isolated; the scan continues."""
+
+    def test_missing_table_added_to_failed_tables(self, tmp_path):
+        """A nonexistent table appears in failed_tables, not in tables."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users", "ghost_table"], policy, audit)
+            successful_names = {r.table for r in result.tables}
+            failed_names = {f.name for f in result.failed_tables}
+            assert "users" in successful_names
+            assert "ghost_table" in failed_names
+        finally:
+            adapter.close()
+
+    def test_scan_continues_after_failure(self, tmp_path):
+        """A failing table in the middle does not stop subsequent tables."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(
+                adapter,
+                ["users", "ghost_table", "orders"],
+                policy,
+                audit,
+            )
+            successful_names = {r.table for r in result.tables}
+            assert "users" in successful_names
+            assert "orders" in successful_names
+            assert len(result.failed_tables) == 1
+        finally:
+            adapter.close()
+
+    def test_all_tables_fail_returns_empty_tables_list(self, tmp_path):
+        """If every input table fails, tables is [] and failed_tables has them all."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["ghost1", "ghost2"], policy, audit)
+            assert result.tables == []
+            assert len(result.failed_tables) == 2
+            assert {f.name for f in result.failed_tables} == {"ghost1", "ghost2"}
+        finally:
+            adapter.close()
+
+    def test_failed_table_carries_error_message(self, tmp_path):
+        """FailedTable.error is non-empty and human-readable."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["ghost_table"], policy, audit)
+            assert len(result.failed_tables) == 1
+            assert result.failed_tables[0].error  # non-empty string
+        finally:
+            adapter.close()
+
+    def test_empty_tables_list_returns_empty_result(self, tmp_path):
+        """An empty tables input produces an empty ScanResult and still emits bookends."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            result = classify_tables(adapter, [], policy, audit)
+            assert result.tables == []
+            assert result.failed_tables == []
+            # Bookend events should still fire
+            event_types = [e.event_type for e in storage.read_all()]
+            assert EventType.SCAN_STARTED in event_types
+            assert EventType.SCAN_COMPLETED in event_types
+        finally:
+            adapter.close()
+
+
+class TestScanResultShape:
+    """Pydantic constraints on ScanResult and FailedTable."""
+
+    def test_scan_result_is_frozen(self):
+        """ScanResult is immutable after construction."""
+        result = ScanResult(tables=[], failed_tables=[])
+        with pytest.raises(ValidationError):
+            result.tables = [None]  # type: ignore[misc]
+
+    def test_scan_result_rejects_unknown_fields(self):
+        """ScanResult enforces extra='forbid'."""
+        with pytest.raises(ValidationError):
+            ScanResult(tables=[], failed_tables=[], extra_field="x")  # type: ignore[call-arg]
+
+    def test_failed_table_is_frozen(self):
+        """FailedTable is immutable."""
+        ft = FailedTable(name="x", error="oops")
+        with pytest.raises(ValidationError):
+            ft.name = "y"  # type: ignore[misc]
+
+    def test_failed_table_rejects_unknown_fields(self):
+        """FailedTable enforces extra='forbid'."""
+        with pytest.raises(ValidationError):
+            FailedTable(name="x", error="oops", extra="bad")  # type: ignore[call-arg]
