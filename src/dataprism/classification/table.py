@@ -18,6 +18,7 @@ APIs directly.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict
@@ -229,6 +230,9 @@ def classify_tables(
     sample_size: int = 1000,
     strategy: SamplingStrategy = SamplingStrategy.SEQUENTIAL,
     actor: str = "classify_tables",
+    on_table_start: Callable[[str], None] | None = None,
+    on_table_complete: Callable[[str, TableClassificationReport], None] | None = None,
+    on_table_failed: Callable[[str, str], None] | None = None,
 ) -> ScanResult:
     """Classify every column across multiple tables.
 
@@ -253,6 +257,17 @@ def classify_tables(
         strategy: How to sample values. Default SEQUENTIAL.
         actor: Actor name recorded on audit events. Default
             "classify_tables".
+        on_table_start: Optional callback invoked before each table's
+            classification begins. Receives the table name. Use for
+            progress UI; do not raise from this callback (the engine
+            does not catch).
+        on_table_complete: Optional callback invoked after a table
+            is successfully classified. Receives the table name and
+            its TableClassificationReport.
+        on_table_failed: Optional callback invoked when a table's
+            classification fails (i.e., classify_table raised
+            AdapterError). Receives the table name and the error
+            message string.
 
     Returns:
         A ScanResult with per-table reports and per-table failures.
@@ -282,6 +297,8 @@ def classify_tables(
     failed: list[FailedTable] = []
 
     for table in tables:
+        if on_table_start is not None:
+            on_table_start(table)
         try:
             report = classify_table(
                 adapter,
@@ -293,8 +310,12 @@ def classify_tables(
                 actor=actor,
             )
             successful_reports.append(report)
+            if on_table_complete is not None:
+                on_table_complete(table, report)
         except AdapterError as e:
             failed.append(FailedTable(name=table, error=str(e)))
+            if on_table_failed is not None:
+                on_table_failed(table, str(e))
 
     # Total classifications = sum of columns with at least one match,
     # across all successful tables. A column contributes 1 if it had

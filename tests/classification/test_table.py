@@ -1006,6 +1006,91 @@ class TestClassifyTablesErrorHandling:
             adapter.close()
 
 
+class TestClassifyTablesCallbacks:
+    """Optional progress callbacks fire at the right moments."""
+
+    def test_on_table_start_invoked_for_each_table(self, tmp_path):
+        """on_table_start receives the name of every input table."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            seen: list[str] = []
+            classify_tables(
+                adapter,
+                ["users", "orders"],
+                policy,
+                audit,
+                on_table_start=lambda name: seen.append(name),
+            )
+            assert seen == ["users", "orders"]
+        finally:
+            adapter.close()
+
+    def test_on_table_complete_invoked_for_successful_tables(self, tmp_path):
+        """on_table_complete fires with the report for each success."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            completed: list[tuple[str, int]] = []
+            classify_tables(
+                adapter,
+                ["users", "orders"],
+                policy,
+                audit,
+                on_table_complete=lambda name, report: completed.append(
+                    (name, report.columns_attempted)
+                ),
+            )
+            assert len(completed) == 2
+            names = [c[0] for c in completed]
+            assert set(names) == {"users", "orders"}
+        finally:
+            adapter.close()
+
+    def test_on_table_failed_invoked_for_failed_tables(self, tmp_path):
+        """on_table_failed fires for tables that couldn't be classified."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            failures: list[tuple[str, str]] = []
+            classify_tables(
+                adapter,
+                ["users", "ghost_table"],
+                policy,
+                audit,
+                on_table_failed=lambda name, err: failures.append((name, err)),
+            )
+            assert len(failures) == 1
+            assert failures[0][0] == "ghost_table"
+            assert failures[0][1]  # non-empty error string
+        finally:
+            adapter.close()
+
+    def test_callbacks_default_to_none_no_op(self, tmp_path):
+        """If no callbacks are passed, classify_tables runs cleanly."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            # Just verify no error - we're testing that None callbacks
+            # don't get invoked.
+            result = classify_tables(adapter, ["users"], policy, audit)
+            assert len(result.tables) == 1
+        finally:
+            adapter.close()
+
+
 class TestScanResultShape:
     """Pydantic constraints on ScanResult and FailedTable."""
 

@@ -29,10 +29,20 @@ import typer
 from dataprism.adapters.errors import AdapterError
 from dataprism.audit.service import AuditService
 from dataprism.audit.storage import ChainVerificationError, JsonLinesStorage
-from dataprism.classification.table import classify_table
+from dataprism.classification.candidates import list_table_candidates
+from dataprism.classification.table import classify_table, classify_tables
 from dataprism.cli import adapters as cli_adapters
 from dataprism.cli import paths as cli_paths
-from dataprism.cli.render import render_json, render_text
+from dataprism.cli.render import (
+    render_candidates_json,
+    render_candidates_text,
+    render_json,
+    render_progress_complete_continuation,
+    render_progress_error_continuation,
+    render_progress_start,
+    render_scan_summary,
+    render_text,
+)
 from dataprism.policy.loader import load_classification_policy
 
 # ---- App scaffolding ------------------------------------------------
@@ -93,7 +103,8 @@ def table_classify(
     table: str = typer.Option(
         ...,
         "--table",
-        help="Table to classify (e.g., 'users' or 'public.users').",
+        help="Table name, or comma-separated list of names (e.g., "
+        "'users' or 'users,orders,customers'). Duplicates deduped.",
     ),
     policy: str = typer.Option(
         ...,
@@ -103,7 +114,8 @@ def table_classify(
     output: OutputFormat = typer.Option(
         OutputFormat.text,
         "--output",
-        help="Output format.",
+        help="Output format. Only applies in single-table mode; "
+        "multi-table mode always uses text progress output.",
     ),
     actor: str = typer.Option(
         "cli",
@@ -111,17 +123,28 @@ def table_classify(
         help="Actor name recorded on audit events.",
     ),
 ) -> None:
-    """Classify columns in a table according to a policy.
+    """Classify columns in one or more tables according to a policy.
+
+    The --table option accepts a single table name or a comma-
+    separated list. With one table, output mirrors the single-table
+    classify (text or JSON). With multiple tables, progress lines
+    stream per table and a summary follows.
 
     Reads DSN from DATAPRISM_DSN env var. The policy is resolved
     against config/policies/<name>.yaml in the project root. Audit
     events go to <project-root>/audit/audit.jsonl.
     """
+    # Parse the --table input into a deduplicated list.
+    # dict.fromkeys preserves first-occurrence order.
+    table_names = list(dict.fromkeys(t.strip() for t in table.split(",") if t.strip()))
+    if not table_names:
+        typer.echo("Error: --table must specify at least one table name.", err=True)
+        raise typer.Exit(code=2)
+
     # Resolve and validate inputs
     dsn = _read_dsn_from_env()
     policy_path = cli_paths.get_policy_path(policy)
     if not policy_path.exists():
-        # List what IS available to be helpful
         policies_dir = policy_path.parent
         available = sorted(p.stem for p in policies_dir.glob("*.yaml"))
         avail_str = ", ".join(available) if available else "(none)"
@@ -147,7 +170,43 @@ def table_classify(
 
     loaded_policy = load_classification_policy(policy_path)
 
-    # Connect, run, disconnect
+    # Branch: single vs multi
+    if len(table_names) == 1:
+        _run_single_table_classify(
+            adapter=adapter,
+            normalized_dsn=normalized_dsn,
+            table=table_names[0],
+            loaded_policy=loaded_policy,
+            audit=audit,
+            actor=actor,
+            output=output,
+            audit_log_path=audit_log_path,
+        )
+    else:
+        _run_multi_table_classify(
+            adapter=adapter,
+            normalized_dsn=normalized_dsn,
+            tables=table_names,
+            loaded_policy=loaded_policy,
+            policy_name=policy,
+            audit=audit,
+            actor=actor,
+            audit_log_path=audit_log_path,
+        )
+
+
+def _run_single_table_classify(
+    *,
+    adapter,
+    normalized_dsn: str,
+    table: str,
+    loaded_policy,
+    audit,
+    actor: str,
+    output: OutputFormat,
+    audit_log_path,
+) -> None:
+    """Existing PR 10 single-table path. Detailed text or JSON output."""
     try:
         adapter.connect(normalized_dsn)
         try:
@@ -164,12 +223,139 @@ def table_classify(
         typer.echo(f"Database error: {e}", err=True)
         raise typer.Exit(code=1) from e
 
-    # Render and print
     if output == OutputFormat.json:
         typer.echo(render_json(report))
     else:
         typer.echo(render_text(report))
         typer.echo(f"Audit log: {audit_log_path}")
+
+
+def _run_multi_table_classify(
+    *,
+    adapter,
+    normalized_dsn: str,
+    tables: list[str],
+    loaded_policy,
+    policy_name: str,
+    audit,
+    actor: str,
+    audit_log_path,
+) -> None:
+    """Multi-table path. Streams per-table progress; summary at end.
+
+    Output is always text (the --output flag doesn't apply here,
+    since the format is interactive progress, not a single report).
+    """
+
+    def on_start(name: str) -> None:
+        typer.echo(render_progress_start(name), nl=False)
+
+    def on_complete(name: str, report) -> None:
+        typer.echo(render_progress_complete_continuation(report))
+
+    def on_failed(name: str, err: str) -> None:
+        typer.echo(render_progress_error_continuation(err))
+
+    try:
+        adapter.connect(normalized_dsn)
+        try:
+            scan_result = classify_tables(
+                adapter,
+                tables,
+                loaded_policy,
+                audit,
+                policy_name=policy_name,
+                actor=actor,
+                on_table_start=on_start,
+                on_table_complete=on_complete,
+                on_table_failed=on_failed,
+            )
+        finally:
+            adapter.close()
+    except AdapterError as e:
+        typer.echo(f"Database error: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(render_scan_summary(scan_result))
+    typer.echo(f"Audit log: {audit_log_path}")
+
+
+# ---- table candidates ------------------------------------------------
+
+
+@table_app.command("candidates")
+def table_candidates(
+    policy: str = typer.Option(
+        ...,
+        "--policy",
+        help="Policy name (resolves to config/policies/<name>.yaml).",
+    ),
+    schema: str = typer.Option(
+        None,
+        "--schema",
+        help="Schema name to narrow the listing. Omit for the "
+        "adapter's default scope (public for Postgres; all tables "
+        "for SQLite).",
+    ),
+    output: OutputFormat = typer.Option(
+        OutputFormat.text,
+        "--output",
+        help="Output format.",
+    ),
+) -> None:
+    """List candidate tables, annotated with name-rule match counts.
+
+    Walks tables in scope (per the adapter's default or --schema),
+    and for each, counts how many columns match the policy's
+    NAME-BASED rules (regex with target=column_name; dictionary).
+    Statistical and value-based rules are not evaluated here -
+    those require sampling, which would defeat the purpose of a
+    cheap pre-scan.
+
+    Tables are sorted by match count descending (most likely scan
+    targets first), then alphabetically.
+
+    Match counts are a heuristic: a 0-match table may still
+    contain sensitive data in oddly-named columns. Classify to
+    be sure.
+    """
+    dsn = _read_dsn_from_env()
+    policy_path = cli_paths.get_policy_path(policy)
+    if not policy_path.exists():
+        policies_dir = policy_path.parent
+        available = sorted(p.stem for p in policies_dir.glob("*.yaml"))
+        avail_str = ", ".join(available) if available else "(none)"
+        typer.echo(
+            f"Error: Policy '{policy}' not found.\n"
+            f"  Looked at: {policy_path}\n"
+            f"  Available policies: {avail_str}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        adapter = cli_adapters.select_adapter(dsn)
+        normalized_dsn = cli_adapters.normalize_dsn(dsn)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=2) from e
+
+    loaded_policy = load_classification_policy(policy_path)
+
+    try:
+        adapter.connect(normalized_dsn)
+        try:
+            candidates = list_table_candidates(adapter, loaded_policy, schema=schema)
+        finally:
+            adapter.close()
+    except AdapterError as e:
+        typer.echo(f"Database error: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    if output == OutputFormat.json:
+        typer.echo(render_candidates_json(candidates, schema=schema))
+    else:
+        typer.echo(render_candidates_text(candidates, schema=schema))
 
 
 # ---- audit verify ----------------------------------------------------

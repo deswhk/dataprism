@@ -79,6 +79,33 @@ def _make_users_db(path: Path) -> str:
     return dsn
 
 
+def _make_multi_table_db_for_cli(path: Path) -> str:
+    """Create a SQLite database with multiple tables for multi-table tests.
+
+    Returns the DSN. Schema:
+        users (id, email, name)           - 3 cols, email matches PII rules
+        orders (id, customer_id, total)   - 3 cols, no name matches
+        products (id, sku, name, price)   - 4 cols, name matches some rules
+    """
+    dsn = f"sqlite:///{path}"
+    engine = create_engine(dsn)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE users (id INTEGER, email TEXT, name TEXT)"))
+            conn.execute(text("INSERT INTO users VALUES (1, 'alice@example.com', 'Alice')"))
+            conn.execute(text("INSERT INTO users VALUES (2, 'bob@example.com', 'Bob')"))
+            conn.execute(text("CREATE TABLE orders (id INTEGER, customer_id INTEGER, total REAL)"))
+            conn.execute(text("INSERT INTO orders VALUES (1, 1, 50.0)"))
+            conn.execute(text("INSERT INTO orders VALUES (2, 2, 75.0)"))
+            conn.execute(
+                text("CREATE TABLE products (id INTEGER, sku TEXT, name TEXT, price REAL)")
+            )
+            conn.execute(text("INSERT INTO products VALUES (1, 'A-001', 'Widget', 9.99)"))
+    finally:
+        engine.dispose()
+    return dsn
+
+
 @pytest.fixture
 def temp_audit_log(tmp_path, monkeypatch):
     """Redirect the audit log to a temp directory for the test.
@@ -116,6 +143,16 @@ class TestHelpText:
         assert result.exit_code == 0
         stdout = _strip_ansi(result.stdout)
         assert "classify" in stdout
+        assert "candidates" in stdout
+
+    def test_table_candidates_help(self):
+        """dataprism table candidates --help shows the options."""
+        result = runner.invoke(app, ["table", "candidates", "--help"])
+        assert result.exit_code == 0
+        stdout = _strip_ansi(result.stdout)
+        assert "--policy" in stdout
+        assert "--schema" in stdout
+        assert "--output" in stdout
 
     def test_table_classify_help(self):
         """dataprism table classify --help shows the options."""
@@ -420,3 +457,251 @@ class TestAuditVerify:
         parsed = json.loads(result.stdout)
         assert parsed["status"] == "ok"
         assert "audit_log" in parsed
+
+
+# ---- Multi-table classify -------------------------------------------
+
+
+class TestMultiTableClassify:
+    """Comma-separated --table input and multi-table progress output."""
+
+    def test_two_tables_succeed(self, tmp_path, monkeypatch, temp_audit_log):
+        """Two tables in --table both classify; exit 0."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,orders", "--policy", "example"],
+        )
+        assert result.exit_code == 0
+
+    def test_progress_line_emitted_per_table(self, tmp_path, monkeypatch, temp_audit_log):
+        """Each table gets its own progress line."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,orders", "--policy", "example"],
+        )
+        assert "Scanning users" in result.stdout
+        assert "Scanning orders" in result.stdout
+
+    def test_summary_line_present(self, tmp_path, monkeypatch, temp_audit_log):
+        """Final summary shows the table count and classification total."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,orders", "--policy", "example"],
+        )
+        assert "Scanned 2 tables" in result.stdout
+        assert "classifications total" in result.stdout
+
+    def test_clean_run_omits_succeeded_failed(self, tmp_path, monkeypatch, temp_audit_log):
+        """No failures means no '(X succeeded, Y failed)' parenthetical."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,orders", "--policy", "example"],
+        )
+        # Inspect the summary line specifically (avoid false positives
+        # from path names that happen to contain "succeeded").
+        summary_lines = [line for line in result.stdout.splitlines() if line.startswith("Scanned ")]
+        assert len(summary_lines) == 1
+        summary = summary_lines[0]
+        assert "succeeded" not in summary
+        assert "failed" not in summary
+
+    def test_failed_table_shows_error_line(self, tmp_path, monkeypatch, temp_audit_log):
+        """A nonexistent table produces an ERROR line and the scan continues."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,ghost,orders", "--policy", "example"],
+        )
+        # Scan continues despite the failure; exit code is still 0
+        assert result.exit_code == 0
+        assert "Scanning users" in result.stdout
+        assert "Scanning ghost" in result.stdout
+        assert "ERROR" in result.stdout
+        assert "Scanning orders" in result.stdout
+
+    def test_partial_failure_summary_shows_counts(self, tmp_path, monkeypatch, temp_audit_log):
+        """Summary with partial failure shows '(X succeeded, Y failed)' parenthetical."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,ghost", "--policy", "example"],
+        )
+        assert "succeeded" in result.stdout
+        assert "failed" in result.stdout
+
+    def test_duplicate_tables_deduped(self, tmp_path, monkeypatch, temp_audit_log):
+        """Duplicate names in --table are silently deduped."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            [
+                "table",
+                "classify",
+                "--table",
+                "users,users,users",
+                "--policy",
+                "example",
+            ],
+        )
+        # Single table mode (single unique name after dedupe), so detailed
+        # output should appear instead of progress lines.
+        assert "Classified table 'users'" in result.stdout
+
+    def test_whitespace_stripped_around_table_names(self, tmp_path, monkeypatch, temp_audit_log):
+        """Spaces around comma-separated table names are stripped."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            [
+                "table",
+                "classify",
+                "--table",
+                "users, orders , products",
+                "--policy",
+                "example",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "Scanned 3 tables" in result.stdout
+
+    def test_audit_log_includes_scan_bookends(self, tmp_path, monkeypatch, temp_audit_log):
+        """Multi-table run records SCAN_STARTED and SCAN_COMPLETED events."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        runner.invoke(
+            app,
+            ["table", "classify", "--table", "users,orders", "--policy", "example"],
+        )
+        content = temp_audit_log.read_text(encoding="utf-8")
+        assert "scan_started" in content
+        assert "scan_completed" in content
+
+
+# ---- Table candidates -----------------------------------------------
+
+
+class TestTableCandidates:
+    """The new `dataprism table candidates` command."""
+
+    def test_candidates_against_sqlite_succeeds(self, tmp_path, monkeypatch, temp_audit_log):
+        """A normal candidates listing exits 0."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        assert result.exit_code == 0
+
+    def test_candidates_lists_all_tables(self, tmp_path, monkeypatch, temp_audit_log):
+        """Output mentions every table in the database."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        assert "users" in result.stdout
+        assert "orders" in result.stdout
+        assert "products" in result.stdout
+
+    def test_candidates_text_includes_match_counts(self, tmp_path, monkeypatch, temp_audit_log):
+        """Text output shows 'matching' counts per table."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        assert "matching" in result.stdout
+
+    def test_candidates_text_includes_caveat(self, tmp_path, monkeypatch, temp_audit_log):
+        """Caveat text appears at the bottom of the output."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        assert "column-name rules only" in result.stdout
+
+    def test_candidates_json_output_is_parseable(self, tmp_path, monkeypatch, temp_audit_log):
+        """--output json produces valid JSON."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "candidates", "--policy", "example", "--output", "json"],
+        )
+        assert result.exit_code == 0
+        parsed = json.loads(result.stdout)
+        assert isinstance(parsed, dict)
+
+    def test_candidates_json_has_expected_structure(self, tmp_path, monkeypatch, temp_audit_log):
+        """JSON has schema, total_tables, tables top-level keys."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "candidates", "--policy", "example", "--output", "json"],
+        )
+        parsed = json.loads(result.stdout)
+        assert "schema" in parsed
+        assert "total_tables" in parsed
+        assert "tables" in parsed
+        assert parsed["total_tables"] == 3
+
+    def test_candidates_sort_order_matches_engine(self, tmp_path, monkeypatch, temp_audit_log):
+        """JSON tables list is sorted match_count desc."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(
+            app,
+            ["table", "candidates", "--policy", "example", "--output", "json"],
+        )
+        parsed = json.loads(result.stdout)
+        counts = [t["match_count"] for t in parsed["tables"]]
+        # Confirm descending order
+        assert counts == sorted(counts, reverse=True)
+
+    def test_candidates_unknown_policy_errors(self, tmp_path, monkeypatch, temp_audit_log):
+        """Unknown policy name exits 2."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        result = runner.invoke(app, ["table", "candidates", "--policy", "nonexistent"])
+        assert result.exit_code == 2
+        assert "nonexistent" in result.stderr
+
+    def test_candidates_missing_dsn_errors(self, monkeypatch, temp_audit_log):
+        """Without DATAPRISM_DSN, candidates exits 2."""
+        monkeypatch.delenv("DATAPRISM_DSN", raising=False)
+        result = runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        assert result.exit_code == 2
+        assert "DATAPRISM_DSN" in result.stderr
+
+    def test_candidates_does_not_write_audit_log(self, tmp_path, monkeypatch, temp_audit_log):
+        """Candidates listing doesn't classify, so no audit events are recorded."""
+        dsn = _make_multi_table_db_for_cli(tmp_path / "test.db")
+        monkeypatch.setenv("DATAPRISM_DSN", dsn)
+
+        runner.invoke(app, ["table", "candidates", "--policy", "example"])
+        # Audit log shouldn't exist (or if it does, it's empty)
+        if temp_audit_log.exists():
+            assert temp_audit_log.read_text(encoding="utf-8").strip() == ""
