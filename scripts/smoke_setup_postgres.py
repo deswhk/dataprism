@@ -1,7 +1,7 @@
 """Create test tables in the Docker Postgres for smoke testing PR 11.
 
 Usage:
-    $env:DATAPRISM_DSN = "postgresql://postgres:devpassword@localhost:5432/dataprism"
+    $env:DATAPRISM_DSN = "postgresql://postgres:<your-postgres-password>@localhost:5432/dataprism"
     python scripts/smoke_setup_postgres.py
 
 Drops and recreates three tables in the 'public' schema.
