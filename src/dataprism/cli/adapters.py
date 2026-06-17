@@ -74,9 +74,65 @@ def select_adapter(dsn: str) -> DatabaseAdapter:
     for prefix, (adapter_factory, _) in _DSN_DISPATCH.items():
         if dsn.startswith(prefix):
             return adapter_factory()
-
     known = ", ".join(_DSN_DISPATCH.keys())
     raise ValueError(
         f"Unknown DSN scheme. Supported prefixes: {known}. "
         f"Got prefix: {dsn.split('://', 1)[0] if '://' in dsn else dsn[:20]}"
     )
+
+
+def redact_dsn_for_display(dsn: str) -> str:
+    """Replace any password component of a DSN with '***'.
+
+    Used to produce a target_summary string suitable for governance
+    artifacts (HTML reports). Never sees the original password's
+    value, never logs it.
+
+    A DSN of the form `scheme://user:password@host/db` becomes
+    `scheme://user:***@host/db`. DSNs with no password (no colon
+    before the @) or no auth section (sqlite paths, etc.) are
+    returned unchanged.
+
+    Implementation note: the function looks for the first '://'
+    (scheme separator) and the last '@' before the next '/' (end of
+    authority). If a ':' appears between them, everything after that
+    ':' up to the '@' is treated as the password and replaced. This
+    handles passwords containing '@' or other special characters,
+    as long as the database accepts URL-encoded forms (which all
+    major drivers do).
+
+    Args:
+        dsn: The DSN string.
+
+    Returns:
+        The DSN with the password replaced by '***', or the original
+        DSN if no password was present.
+    """
+    scheme_sep = dsn.find("://")
+    if scheme_sep == -1:
+        return dsn
+
+    auth_start = scheme_sep + 3
+    # The authority section ends at the first '/' (start of path),
+    # or at end of string if no path.
+    path_start = dsn.find("/", auth_start)
+    if path_start == -1:
+        path_start = len(dsn)
+
+    authority = dsn[auth_start:path_start]
+    # Find the LAST '@' inside the authority so passwords containing
+    # '@' are handled robustly.
+    at_pos = authority.rfind("@")
+    if at_pos == -1:
+        return dsn  # No userinfo, nothing to redact
+
+    userinfo = authority[:at_pos]
+    host_part = authority[at_pos:]  # includes the '@'
+
+    # In userinfo, the password follows the first ':'.
+    colon_pos = userinfo.find(":")
+    if colon_pos == -1:
+        return dsn  # User but no password, nothing to redact
+
+    redacted_userinfo = userinfo[: colon_pos + 1] + "***"
+    return dsn[:auth_start] + redacted_userinfo + host_part + dsn[path_start:]

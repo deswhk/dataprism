@@ -11,7 +11,7 @@ import pytest
 
 from dataprism.adapters.postgres import PostgresAdapter
 from dataprism.adapters.sqlite import SqliteAdapter
-from dataprism.cli.adapters import normalize_dsn, select_adapter
+from dataprism.cli.adapters import normalize_dsn, redact_dsn_for_display, select_adapter
 
 
 class TestNormalizeDsn:
@@ -101,3 +101,64 @@ class TestSelectAdapter:
             select_adapter("redis://user:my-secret-key@host/0")
         msg = str(exc_info.value)
         assert "my-secret-key" not in msg
+
+
+class TestRedactDsnForDisplay:
+    """DSN passwords are replaced with '***' for display."""
+
+    def test_postgres_dsn_with_password_redacted(self):
+        """A standard Postgres DSN's password is replaced."""
+        result = redact_dsn_for_display("postgresql://user:secret@host:5432/db")
+        assert result == "postgresql://user:***@host:5432/db"
+        assert "secret" not in result
+
+    def test_postgres_dsn_without_password_unchanged(self):
+        """A Postgres DSN with no password is returned as-is."""
+        dsn = "postgresql://user@host:5432/db"
+        assert redact_dsn_for_display(dsn) == dsn
+
+    def test_sqlite_dsn_unchanged(self):
+        """SQLite DSNs have no auth section and are returned as-is."""
+        dsn = "sqlite:///path/to/file.db"
+        assert redact_dsn_for_display(dsn) == dsn
+
+    def test_sqlite_empty_dsn_unchanged(self):
+        """sqlite:// (empty) is returned unchanged."""
+        assert redact_dsn_for_display("sqlite://") == "sqlite://"
+
+    def test_password_with_at_symbol_redacted(self):
+        """A password containing '@' is still fully redacted.
+
+        Uses rfind('@') in the authority section so the actual end
+        of userinfo is found correctly.
+        """
+        result = redact_dsn_for_display("postgresql://user:has@symbol@host/db")
+        assert result == "postgresql://user:***@host/db"
+        assert "has@symbol" not in result
+
+    def test_dsn_without_path_redacted(self):
+        """A DSN with no path after the host is handled."""
+        result = redact_dsn_for_display("postgresql://user:pw@host")
+        assert result == "postgresql://user:***@host"
+        assert "pw" not in result
+
+    def test_no_scheme_returned_unchanged(self):
+        """A string without '://' is not a DSN and is returned as-is."""
+        assert redact_dsn_for_display("no_scheme") == "no_scheme"
+
+    def test_empty_password_redacted_to_stars(self):
+        """A user with an empty password (e.g., 'user:@host') still gets '***'."""
+        result = redact_dsn_for_display("postgresql://user:@host/db")
+        assert result == "postgresql://user:***@host/db"
+
+    def test_special_characters_in_password_redacted(self):
+        """Special URL-encoded password characters are all replaced."""
+        result = redact_dsn_for_display("postgresql://u:p%40ss%23word@h/d")
+        assert "p%40ss%23word" not in result
+        assert "***" in result
+        assert result == "postgresql://u:***@h/d"
+
+    def test_returns_str_type(self):
+        """Always returns a str, even for unchanged DSNs."""
+        assert isinstance(redact_dsn_for_display("sqlite://"), str)
+        assert isinstance(redact_dsn_for_display("postgresql://user:pw@host/db"), str)
