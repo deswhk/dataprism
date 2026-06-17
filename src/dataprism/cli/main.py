@@ -30,12 +30,13 @@ from dataprism.adapters.errors import AdapterError
 from dataprism.audit.service import AuditService
 from dataprism.audit.storage import ChainVerificationError, JsonLinesStorage
 from dataprism.classification.candidates import list_table_candidates
-from dataprism.classification.table import classify_table, classify_tables
+from dataprism.classification.table import classify_tables
 from dataprism.cli import adapters as cli_adapters
 from dataprism.cli import paths as cli_paths
 from dataprism.cli.render import (
     render_candidates_json,
     render_candidates_text,
+    render_html_report,
     render_json,
     render_progress_complete_continuation,
     render_progress_error_continuation,
@@ -170,101 +171,74 @@ def table_classify(
 
     loaded_policy = load_classification_policy(policy_path)
 
-    # Branch: single vs multi
-    if len(table_names) == 1:
-        _run_single_table_classify(
-            adapter=adapter,
-            normalized_dsn=normalized_dsn,
-            table=table_names[0],
-            loaded_policy=loaded_policy,
-            audit=audit,
-            actor=actor,
-            output=output,
-            audit_log_path=audit_log_path,
-        )
-    else:
-        _run_multi_table_classify(
-            adapter=adapter,
-            normalized_dsn=normalized_dsn,
-            tables=table_names,
-            loaded_policy=loaded_policy,
-            policy_name=policy,
-            audit=audit,
-            actor=actor,
-            audit_log_path=audit_log_path,
-        )
+    _run_classify_scan(
+        adapter=adapter,
+        normalized_dsn=normalized_dsn,
+        dsn=dsn,
+        tables=table_names,
+        loaded_policy=loaded_policy,
+        policy_name=policy,
+        audit=audit,
+        actor=actor,
+        output=output,
+        audit_log_path=audit_log_path,
+    )
 
 
-def _run_single_table_classify(
+def _run_classify_scan(
     *,
     adapter,
     normalized_dsn: str,
-    table: str,
-    loaded_policy,
-    audit,
-    actor: str,
-    output: OutputFormat,
-    audit_log_path,
-) -> None:
-    """Existing PR 10 single-table path. Detailed text or JSON output."""
-    try:
-        adapter.connect(normalized_dsn)
-        try:
-            report = classify_table(
-                adapter,
-                table,
-                loaded_policy,
-                audit,
-                actor=actor,
-            )
-        finally:
-            adapter.close()
-    except AdapterError as e:
-        typer.echo(f"Database error: {e}", err=True)
-        raise typer.Exit(code=1) from e
-
-    if output == OutputFormat.json:
-        typer.echo(render_json(report))
-    else:
-        typer.echo(render_text(report))
-        typer.echo(f"Audit log: {audit_log_path}")
-
-
-def _run_multi_table_classify(
-    *,
-    adapter,
-    normalized_dsn: str,
+    dsn: str,
     tables: list[str],
     loaded_policy,
     policy_name: str,
     audit,
     actor: str,
+    output: OutputFormat,
     audit_log_path,
 ) -> None:
-    """Multi-table path. Streams per-table progress; summary at end.
+    """Unified classify-scan execution.
 
-    Output is always text (the --output flag doesn't apply here,
-    since the format is interactive progress, not a single report).
+    Always calls classify_tables. Branches only on display:
+
+    - Single table (len(tables) == 1): emits the detailed per-column
+      text or JSON of PR 10. No progress callbacks (one table doesn't
+      need a feed).
+    - Multiple tables: streams per-table progress lines via callbacks,
+      then emits the final summary.
+
+    After the engine returns, always writes the HTML report and prints
+    its path plus the audit log path.
     """
+    is_multi = len(tables) > 1
+    target_summary = cli_adapters.redact_dsn_for_display(dsn)
 
-    def on_start(name: str) -> None:
-        typer.echo(render_progress_start(name), nl=False)
+    # Progress callbacks are only useful for multi-table runs.
+    on_start = None
+    on_complete = None
+    on_failed = None
+    if is_multi:
 
-    def on_complete(name: str, report) -> None:
-        typer.echo(render_progress_complete_continuation(report))
+        def on_start(name: str) -> None:
+            typer.echo(render_progress_start(name), nl=False)
 
-    def on_failed(name: str, err: str) -> None:
-        typer.echo(render_progress_error_continuation(err))
+        def on_complete(name: str, report) -> None:
+            typer.echo(render_progress_complete_continuation(report))
+
+        def on_failed(name: str, err: str) -> None:
+            typer.echo(render_progress_error_continuation(err))
 
     try:
         adapter.connect(normalized_dsn)
         try:
-            scan_result = classify_tables(
+            scan_report = classify_tables(
                 adapter,
                 tables,
                 loaded_policy,
                 audit,
                 policy_name=policy_name,
+                target_summary=target_summary,
                 actor=actor,
                 on_table_start=on_start,
                 on_table_complete=on_complete,
@@ -276,8 +250,53 @@ def _run_multi_table_classify(
         typer.echo(f"Database error: {e}", err=True)
         raise typer.Exit(code=1) from e
 
-    typer.echo(render_scan_summary(scan_result))
-    typer.echo(f"Audit log: {audit_log_path}")
+    # Terminal display.
+    #
+    # Note on exit codes: per-table failures (missing table, denied
+    # permission, etc.) are findings, not program errors - the program
+    # ran, it just didn't find what the user expected. We surface these
+    # in stderr text + the HTML report's Errors section, but exit 0.
+    # Reserve non-zero exits for program-level failures (connection
+    # refused, missing policy file, etc.) and for misuse.
+    if is_multi:
+        typer.echo(render_scan_summary(scan_report))
+    elif output == OutputFormat.json:
+        # Single-table JSON output: the per-table report only, not the
+        # whole ScanReport. Preserves PR 10's contract for scripting
+        # callers that expect a TableClassificationReport shape.
+        # If the table failed, render the failure as the JSON document
+        # instead, so callers get something parseable rather than empty.
+        if scan_report.tables:
+            typer.echo(render_json(scan_report.tables[0]))
+        else:
+            failed = scan_report.failed_tables[0]
+            typer.echo(
+                json.dumps(
+                    {"table": failed.name, "error": failed.error},
+                    indent=2,
+                )
+            )
+    else:
+        # Single-table text output: detailed per-column rendering, or
+        # the failure surfaced to stderr for visibility (but no exit).
+        if scan_report.tables:
+            typer.echo(render_text(scan_report.tables[0]))
+        else:
+            failed = scan_report.failed_tables[0]
+            typer.echo(f"Table not scanned: {failed.error}", err=True)
+
+    # HTML report - always written, even on failure or JSON mode.
+    report_path = cli_paths.get_report_path(scan_report.completed_at)
+    report_path.write_text(
+        render_html_report(scan_report, audit_log_path=audit_log_path),
+        encoding="utf-8",
+    )
+
+    # Trailer (text mode and multi-table only - JSON mode keeps stdout
+    # parseable).
+    if not (is_multi is False and output == OutputFormat.json):
+        typer.echo(f"Report: {report_path}")
+        typer.echo(f"Audit log: {audit_log_path}")
 
 
 # ---- table candidates ------------------------------------------------

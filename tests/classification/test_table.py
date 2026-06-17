@@ -17,6 +17,8 @@ These tests verify:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from pydantic import ValidationError
 
@@ -31,7 +33,7 @@ from dataprism.audit.service import AuditService
 from dataprism.audit.storage import InMemoryStorage
 from dataprism.classification.table import (
     FailedTable,
-    ScanResult,
+    ScanReport,
     TableClassificationReport,
     classify_table,
     classify_tables,
@@ -704,7 +706,7 @@ class TestClassifyTablesHappyPath:
     """Multi-table classify_tables happy path - all tables succeed."""
 
     def test_returns_scan_result(self, tmp_path):
-        """classify_tables returns a ScanResult."""
+        """classify_tables returns a ScanReport."""
         dsn = _make_multi_table_db(tmp_path)
         adapter = SqliteAdapter()
         adapter.connect(dsn)
@@ -712,7 +714,7 @@ class TestClassifyTablesHappyPath:
             policy = _make_policy([_dict_rule("email_cols", ["email"])])
             audit, _ = _make_audit_setup()
             result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
-            assert isinstance(result, ScanResult)
+            assert isinstance(result, ScanReport)
         finally:
             adapter.close()
 
@@ -780,6 +782,135 @@ class TestClassifyTablesHappyPath:
             )
             assert users_matches == 1  # email column
             assert orders_matches == 0
+        finally:
+            adapter.close()
+
+
+class TestClassifyTablesMetadata:
+    """Metadata fields on the returned ScanReport are populated correctly."""
+
+    def test_scan_id_is_a_string(self, tmp_path):
+        """scan_id is populated and is a non-empty string."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit)
+            assert isinstance(result.scan_id, str)
+            assert len(result.scan_id) > 0
+        finally:
+            adapter.close()
+
+    def test_scan_id_matches_audit_event_scan_id(self, tmp_path):
+        """The scan_id on the ScanReport matches the one in audit events.
+
+        This is the cross-reference assertion: a renderered report
+        and the audit log can be tied together via scan_id.
+        """
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, storage = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit)
+
+            # Find SCAN_STARTED in the audit log; its scan_id must match.
+            events = list(storage.read_all())
+            scan_started = [e for e in events if e.event_type == EventType.SCAN_STARTED]
+            assert len(scan_started) == 1
+            assert scan_started[0].data["scan_id"] == result.scan_id
+
+            scan_completed = [e for e in events if e.event_type == EventType.SCAN_COMPLETED]
+            assert len(scan_completed) == 1
+            assert scan_completed[0].data["scan_id"] == result.scan_id
+        finally:
+            adapter.close()
+
+    def test_each_call_produces_unique_scan_id(self, tmp_path):
+        """Two consecutive classify_tables calls produce different scan_ids."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            r1 = classify_tables(adapter, ["users"], policy, audit)
+            r2 = classify_tables(adapter, ["users"], policy, audit)
+            assert r1.scan_id != r2.scan_id
+        finally:
+            adapter.close()
+
+    def test_started_at_is_before_completed_at(self, tmp_path):
+        """started_at <= completed_at; both are UTC datetimes."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit)
+            assert isinstance(result.started_at, datetime)
+            assert isinstance(result.completed_at, datetime)
+            assert result.started_at <= result.completed_at
+            # Both must be tz-aware (UTC).
+            assert result.started_at.tzinfo is not None
+            assert result.completed_at.tzinfo is not None
+        finally:
+            adapter.close()
+
+    def test_policy_name_defaults_to_none(self, tmp_path):
+        """When the caller doesn't pass policy_name, it stays None."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit)
+            assert result.policy_name is None
+        finally:
+            adapter.close()
+
+    def test_policy_name_propagates(self, tmp_path):
+        """policy_name passed to classify_tables appears on the ScanReport."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit, policy_name="example")
+            assert result.policy_name == "example"
+        finally:
+            adapter.close()
+
+    def test_target_summary_defaults_to_none(self, tmp_path):
+        """When the caller doesn't pass target_summary, it stays None."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            result = classify_tables(adapter, ["users"], policy, audit)
+            assert result.target_summary is None
+        finally:
+            adapter.close()
+
+    def test_target_summary_propagates(self, tmp_path):
+        """target_summary passed to classify_tables appears on the ScanReport."""
+        dsn = _make_multi_table_db(tmp_path)
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        try:
+            policy = _make_policy([_dict_rule("email_cols", ["email"])])
+            audit, _ = _make_audit_setup()
+            redacted = "sqlite:///" + str(tmp_path) + "/test.db"
+            result = classify_tables(adapter, ["users"], policy, audit, target_summary=redacted)
+            assert result.target_summary == redacted
         finally:
             adapter.close()
 
@@ -988,7 +1119,7 @@ class TestClassifyTablesErrorHandling:
             adapter.close()
 
     def test_empty_tables_list_returns_empty_result(self, tmp_path):
-        """An empty tables input produces an empty ScanResult and still emits bookends."""
+        """An empty tables input produces an empty ScanReport and still emits bookends."""
         dsn = _make_multi_table_db(tmp_path)
         adapter = SqliteAdapter()
         adapter.connect(dsn)
@@ -1091,19 +1222,74 @@ class TestClassifyTablesCallbacks:
             adapter.close()
 
 
-class TestScanResultShape:
-    """Pydantic constraints on ScanResult and FailedTable."""
+class TestScanReportShape:
+    """Pydantic constraints on ScanReport and FailedTable."""
 
-    def test_scan_result_is_frozen(self):
-        """ScanResult is immutable after construction."""
-        result = ScanResult(tables=[], failed_tables=[])
+    def _empty_kwargs(self) -> dict:
+        """Minimal valid kwargs for a no-tables ScanReport."""
+        now = datetime.now(timezone.utc)
+        return {
+            "scan_id": "00000000-0000-0000-0000-000000000000",
+            "started_at": now,
+            "completed_at": now,
+            "policy_name": None,
+            "target_summary": None,
+            "tables": [],
+            "failed_tables": [],
+        }
+
+    def test_scan_report_is_frozen(self):
+        """ScanReport is immutable after construction."""
+        result = ScanReport(**self._empty_kwargs())
         with pytest.raises(ValidationError):
             result.tables = [None]  # type: ignore[misc]
 
-    def test_scan_result_rejects_unknown_fields(self):
-        """ScanResult enforces extra='forbid'."""
+    def test_scan_report_rejects_unknown_fields(self):
+        """ScanReport enforces extra='forbid'."""
+        kwargs = self._empty_kwargs()
+        kwargs["extra_field"] = "x"
         with pytest.raises(ValidationError):
-            ScanResult(tables=[], failed_tables=[], extra_field="x")  # type: ignore[call-arg]
+            ScanReport(**kwargs)
+
+    def test_scan_report_requires_scan_id(self):
+        """scan_id is a required field; ScanReport rejects construction without it."""
+        kwargs = self._empty_kwargs()
+        del kwargs["scan_id"]
+        with pytest.raises(ValidationError):
+            ScanReport(**kwargs)
+
+    def test_scan_report_requires_started_at(self):
+        """started_at is required."""
+        kwargs = self._empty_kwargs()
+        del kwargs["started_at"]
+        with pytest.raises(ValidationError):
+            ScanReport(**kwargs)
+
+    def test_scan_report_requires_completed_at(self):
+        """completed_at is required."""
+        kwargs = self._empty_kwargs()
+        del kwargs["completed_at"]
+        with pytest.raises(ValidationError):
+            ScanReport(**kwargs)
+
+    def test_scan_report_policy_name_optional(self):
+        """policy_name defaults to None when explicitly None."""
+        report = ScanReport(**self._empty_kwargs())
+        assert report.policy_name is None
+
+    def test_scan_report_target_summary_optional(self):
+        """target_summary defaults to None when explicitly None."""
+        report = ScanReport(**self._empty_kwargs())
+        assert report.target_summary is None
+
+    def test_scan_report_accepts_metadata_strings(self):
+        """policy_name and target_summary accept str values."""
+        kwargs = self._empty_kwargs()
+        kwargs["policy_name"] = "example"
+        kwargs["target_summary"] = "postgresql://localhost:5432/db (password redacted)"
+        report = ScanReport(**kwargs)
+        assert report.policy_name == "example"
+        assert report.target_summary == "postgresql://localhost:5432/db (password redacted)"
 
     def test_failed_table_is_frozen(self):
         """FailedTable is immutable."""

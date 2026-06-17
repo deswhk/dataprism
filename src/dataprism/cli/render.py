@@ -1,11 +1,13 @@
 """Output rendering for the CLI.
 
-This module produces strings for stdout. Two consumers:
+This module produces strings - either for stdout, or written by the
+caller to a file. Four consumers:
 
-1. Single-table classify: render_text/render_json over a
-   TableClassificationReport. The existing PR 9/10 path.
+1. Single-table classify text/JSON: render_text/render_json over a
+   TableClassificationReport. Text goes to stdout; JSON goes to
+   stdout or is piped further.
 
-2. Multi-table classify: render_progress_start +
+2. Multi-table classify progress: render_progress_start +
    render_progress_complete_continuation (or
    render_progress_error_continuation) emit a one-line-per-table
    progress feed. render_scan_summary emits the final summary.
@@ -13,18 +15,25 @@ This module produces strings for stdout. Two consumers:
 3. Candidates listing: render_candidates_text /
    render_candidates_json over a list[TableCandidate].
 
-Future formats (HTML reports in PR 12) will likely use Jinja2
-templates rather than Python string composition. See Section 8 of
-docs/ARCHITECTURE.md.
+4. HTML report: render_html_report over a ScanReport, written to
+   disk by the caller (a self-contained governance artifact, one
+   file per scan). Uses a Jinja2 template in cli/templates/.
+
+The first three are short Python functions composing strings. The
+HTML report is large enough to warrant a template engine; the rest
+are not.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from dataprism.classification.candidates import TableCandidate
 from dataprism.classification.table import (
-    ScanResult,
+    ScanReport,
     TableClassificationReport,
 )
 
@@ -157,7 +166,7 @@ def render_progress_error_continuation(error: str) -> str:
     return f"ERROR ({error})"
 
 
-def render_scan_summary(scan_result: ScanResult) -> str:
+def render_scan_summary(scan_result: ScanReport) -> str:
     """Final summary line(s) for multi-table classify.
 
     Format (clean run):
@@ -289,3 +298,81 @@ def render_candidates_json(
         "tables": [c.model_dump() for c in candidates],
     }
     return json.dumps(payload, indent=2)
+
+
+# ---- HTML report (Jinja2) --------------------------------------------
+
+
+# Module-level Jinja2 environment. Single FileSystemLoader pointing at
+# the templates/ directory next to this file. Autoescape is on for
+# HTML output - protects against unexpected HTML in DSN strings, error
+# messages, etc. (Defense in depth; the engine doesn't pass
+# user-controlled HTML in normal use.)
+_TEMPLATE_DIR = Path(__file__).parent / "templates"
+_jinja_env = Environment(
+    loader=FileSystemLoader(_TEMPLATE_DIR),
+    autoescape=select_autoescape(["html", "htm", "j2"]),
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
+
+
+def render_html_report(
+    scan_report: ScanReport,
+    *,
+    audit_log_path: Path | str | None = None,
+) -> str:
+    """Render a ScanReport as a self-contained HTML document.
+
+    The output is a single HTML file with inline CSS, no JavaScript,
+    no external assets. Designed for distribution as a governance
+    artifact: open, share, print.
+
+    Sensitive data is NOT included. The renderer relies on
+    ScanReport's structure (column names, classification labels,
+    rule names, rule types - no sampled values).
+
+    Args:
+        scan_report: The scan to render.
+        audit_log_path: Optional path to the audit log, shown in the
+            report's footer for cross-reference. The CLI passes it;
+            programmatic callers may omit.
+
+    Returns:
+        A complete HTML document as a string. Caller writes it to
+        disk.
+    """
+    # Compute derived stats that the template uses.
+    duration = (scan_report.completed_at - scan_report.started_at).total_seconds()
+    duration_seconds = f"{duration:.2f}"
+
+    total_columns = sum(t.columns_attempted for t in scan_report.tables)
+    total_classified_columns = sum(
+        sum(1 for matches in t.matches_by_column.values() if matches) for t in scan_report.tables
+    )
+
+    # Build a sorted (category, count) list. A column counts once per
+    # distinct category it has - if a column matched two PII rules, that
+    # still counts as one PII column.
+    category_counts: dict[str, int] = {}
+    for table in scan_report.tables:
+        for matches in table.matches_by_column.values():
+            distinct_categories = {m.classification for m in matches}
+            for cat in distinct_categories:
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+    classifications_by_category = sorted(category_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    # Detect whether any table has per-column errors (the template
+    # uses this to decide whether to show the Errors section header).
+    any_column_errors = any(t.errors for t in scan_report.tables)
+
+    template = _jinja_env.get_template("report.html.j2")
+    return template.render(
+        scan_report=scan_report,
+        duration_seconds=duration_seconds,
+        total_columns=total_columns,
+        total_classified_columns=total_classified_columns,
+        classifications_by_category=classifications_by_category,
+        any_column_errors=any_column_errors,
+        audit_log_path=str(audit_log_path) if audit_log_path else None,
+    )

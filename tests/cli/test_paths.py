@@ -8,12 +8,14 @@ should be.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dataprism.cli.paths import (
     get_audit_log_path,
     get_policy_path,
     get_project_root,
+    get_report_path,
 )
 
 
@@ -97,3 +99,60 @@ class TestGetPolicyPath:
         assert isinstance(path, Path)
         # And confirm the file really doesn't exist
         assert not path.exists()
+
+
+class TestGetReportPath:
+    """Report paths map a timestamp to reports/<YYYY-MM-DD-HHMMSS>.html."""
+
+    def test_returns_path_in_reports_directory(self):
+        """Returned path is under <project-root>/reports/."""
+        ts = datetime(2026, 6, 17, 14, 30, 45, tzinfo=timezone.utc)
+        path = get_report_path(ts)
+        assert path.parent.name == "reports"
+
+    def test_appends_html_extension(self):
+        """The .html extension is appended."""
+        ts = datetime(2026, 6, 17, 14, 30, 45, tzinfo=timezone.utc)
+        path = get_report_path(ts)
+        assert path.suffix == ".html"
+
+    def test_filename_encodes_timestamp(self):
+        """The stem is the YYYY-MM-DD-HHMMSS encoding of the timestamp."""
+        ts = datetime(2026, 6, 17, 14, 30, 45, tzinfo=timezone.utc)
+        path = get_report_path(ts)
+        assert path.stem == "2026-06-17-143045"
+
+    def test_creates_reports_directory(self, tmp_path, monkeypatch):
+        """Calling get_report_path() creates reports/ if absent.
+
+        Uses monkeypatch to redirect the project root to a tmp_path
+        so we can assert directory creation without touching the
+        real project's reports/ folder.
+        """
+        # Create a sham project root that has pyproject.toml
+        (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+        monkeypatch.setattr("dataprism.cli.paths.get_project_root", lambda: tmp_path)
+
+        ts = datetime(2026, 6, 17, 14, 30, 45, tzinfo=timezone.utc)
+        assert not (tmp_path / "reports").exists()
+        path = get_report_path(ts)
+        assert (tmp_path / "reports").is_dir()
+        assert path == tmp_path / "reports" / "2026-06-17-143045.html"
+
+    def test_does_not_create_file(self):
+        """The function only creates the directory, not the file."""
+        ts = datetime(2026, 6, 17, 14, 30, 45, tzinfo=timezone.utc)
+        path = get_report_path(ts)
+        assert not path.exists()  # the .html itself isn't created
+
+    def test_different_timestamps_yield_different_filenames(self):
+        """Two timestamps a minute apart produce different filenames."""
+        ts1 = datetime(2026, 6, 17, 14, 30, 0, tzinfo=timezone.utc)
+        ts2 = datetime(2026, 6, 17, 14, 31, 0, tzinfo=timezone.utc)
+        assert get_report_path(ts1).name != get_report_path(ts2).name
+
+    def test_naive_datetime_also_works(self):
+        """A naive datetime (no tzinfo) is also accepted by strftime."""
+        ts = datetime(2026, 6, 17, 14, 30, 45)  # no tzinfo
+        path = get_report_path(ts)
+        assert path.stem == "2026-06-17-143045"

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>dataprism Scan Report - {{ scan_report.scan_id }}</title>
+<style>
+  /* Base typography */
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #1a1a1a;
+    line-height: 1.5;
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    background: #fafafa;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 0.25rem 0; }
+  h2 { font-size: 1.25rem; margin: 2rem 0 0.75rem 0; border-bottom: 2px solid #e0e0e0; padding-bottom: 0.25rem; }
+  h3 { font-size: 1rem; margin: 1.5rem 0 0.5rem 0; }
+  p { margin: 0.4rem 0; }
+  .muted { color: #666; font-size: 0.9rem; }
+  code, .mono { font-family: "SF Mono", Monaco, Consolas, monospace; font-size: 0.9rem; }
+
+  /* Header card */
+  .header-card {
+    background: #fff;
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+  .header-meta { margin: 0.3rem 0; }
+  .header-meta strong { display: inline-block; min-width: 9rem; color: #444; }
+
+  /* Tables */
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.5rem 0 1rem 0;
+    background: #fff;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid #e0e0e0;
+    vertical-align: top;
+  }
+  th { background: #f0f0f0; font-weight: 600; }
+  td.center, th.center { text-align: center; }
+  td.right, th.right { text-align: right; }
+
+  /* Per-table cards */
+  .table-card {
+    background: #fff;
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 0.75rem 0;
+  }
+  .table-card h3 { margin-top: 0; }
+  .table-card.empty { background: #f5f5f5; }
+  .table-card.empty h3 { color: #777; }
+
+  /* Classification color codes */
+  .label {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #fff;
+  }
+  .label-pii { background: #c0392b; }
+  .label-financial { background: #d35400; }
+  .label-internal { background: #2980b9; }
+  .label-other { background: #555; }
+  .no-match { color: #999; font-style: italic; }
+
+  /* Errors section */
+  .error-box {
+    background: #fdf2f2;
+    border-left: 4px solid #c0392b;
+    padding: 0.5rem 0.75rem;
+    margin: 0.4rem 0;
+  }
+
+  /* Footer */
+  footer {
+    margin-top: 2.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid #d0d0d0;
+    color: #555;
+    font-size: 0.85rem;
+  }
+  footer .mono { color: #333; }
+
+  /* Collapsibles */
+  details {
+    background: #fff;
+    border: 1px solid #d0d0d0;
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+  }
+  details > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: #333;
+  }
+  details[open] > summary { margin-bottom: 0.5rem; }
+  pre {
+    background: #f5f5f5;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    font-size: 0.85rem;
+  }
+
+  /* Print friendliness */
+  @media print {
+    body { background: #fff; max-width: none; margin: 0; padding: 1rem; }
+    .header-card, .table-card, details { border: 1px solid #888; }
+    details { page-break-inside: avoid; }
+    .table-card { page-break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header-card">
+  <h1>dataprism Scan Report</h1>
+  <p class="header-meta"><strong>Completed:</strong> {{ scan_report.completed_at.strftime("%Y-%m-%d %H:%M:%S UTC") }}</p>
+  <p class="header-meta"><strong>Duration:</strong> {{ duration_seconds }}s</p>
+  <p class="header-meta"><strong>Policy:</strong> {{ scan_report.policy_name or "(not specified)" }}</p>
+  <p class="header-meta"><strong>Target:</strong> <span class="mono">{{ scan_report.target_summary or "(not specified)" }}</span></p>
+  <p class="header-meta"><strong>Tables scanned:</strong> {{ scan_report.tables | length }}
+    {%- if scan_report.failed_tables %} ({{ scan_report.failed_tables | length }} failed){% endif %}</p>
+</div>
+
+<h2>Executive summary</h2>
+
+<table>
+  <tr><th>Tables scanned</th><td class="right">{{ scan_report.tables | length }}</td></tr>
+  <tr><th>Tables failed</th><td class="right">{{ scan_report.failed_tables | length }}</td></tr>
+  <tr><th>Columns examined</th><td class="right">{{ total_columns }}</td></tr>
+  <tr><th>Columns classified</th><td class="right">{{ total_classified_columns }}</td></tr>
+</table>
+
+{% if classifications_by_category %}
+<h3>Classifications by category</h3>
+<table>
+  <tr><th>Category</th><th class="right">Columns</th></tr>
+  {% for category, count in classifications_by_category %}
+  <tr>
+    <td><span class="label label-{{ category | lower }}">{{ category }}</span></td>
+    <td class="right">{{ count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">No columns matched any classification rule.</p>
+{% endif %}
+
+<h2>Per-table breakdown</h2>
+
+{% for table in scan_report.tables %}
+{% set has_matches = namespace(val=false) %}
+{% for matches in table.matches_by_column.values() %}
+  {% if matches %}{% set has_matches.val = true %}{% endif %}
+{% endfor %}
+
+<div class="table-card{% if not has_matches.val %} empty{% endif %}">
+  {% if has_matches.val %}
+  <h3>{{ table.table }} ({{ table.columns_attempted }} columns)</h3>
+  <table>
+    <tr><th>Column</th><th>Classification</th><th>Rules matched</th></tr>
+    {% for column, matches in table.matches_by_column.items() %}
+    <tr>
+      <td class="mono">{{ column }}</td>
+      {% if matches %}
+      <td>
+        {% for label in matches | map(attribute="classification") | unique %}
+        <span class="label label-{{ label | lower }}">{{ label }}</span>
+        {% endfor %}
+      </td>
+      <td>
+        {% for m in matches %}
+        <span class="mono">{{ m.rule_name }}</span> <span class="muted">({{ m.rule_type }})</span>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+      </td>
+      {% else %}
+      <td colspan="2" class="no-match">no matches</td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <h3>{{ table.table }} ({{ table.columns_attempted }} columns, no classifications)</h3>
+  {% endif %}
+</div>
+{% endfor %}
+
+{% if not scan_report.tables %}
+<p class="muted">No tables were successfully scanned.</p>
+{% endif %}
+
+{% if scan_report.failed_tables or any_column_errors %}
+<h2>Errors</h2>
+
+{% if scan_report.failed_tables %}
+<h3>Tables that could not be scanned</h3>
+{% for failure in scan_report.failed_tables %}
+<div class="error-box">
+  <p><strong class="mono">{{ failure.name }}</strong></p>
+  <p class="muted">{{ failure.error }}</p>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if any_column_errors %}
+<h3>Per-column errors</h3>
+{% for table in scan_report.tables %}
+  {% if table.errors %}
+  <p><strong class="mono">{{ table.table }}</strong></p>
+  {% for err in table.errors %}
+  <div class="error-box">
+    <p><strong class="mono">{{ err.column }}</strong>: {{ err.error }}</p>
+  </div>
+  {% endfor %}
+  {% endif %}
+{% endfor %}
+{% endif %}
+{% endif %}
+
+<details>
+  <summary>Policy used</summary>
+  <p class="muted">Name: {{ scan_report.policy_name or "(not specified)" }}</p>
+  <p class="muted">Policy details are recorded in the audit log; see the footer for the log location and verification command.</p>
+</details>
+
+<footer>
+  <p><strong>Scan ID:</strong> <span class="mono">{{ scan_report.scan_id }}</span></p>
+  {% if audit_log_path %}
+  <p><strong>Audit log:</strong> <span class="mono">{{ audit_log_path }}</span></p>
+  <p>Run <code>dataprism audit verify</code> to confirm the audit chain is intact.</p>
+  {% endif %}
+  <p class="muted">Generated by dataprism. This report contains no sampled data values.</p>
+</footer>
+
+</body>
+</html>
