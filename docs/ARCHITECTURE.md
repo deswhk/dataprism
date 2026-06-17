@@ -50,7 +50,7 @@ To set expectations precisely:
 
 ### Scope and stage
 
-This is **v2** in progress (Phase 1 complete, Phase 2 in active development). The current scope:
+v2 shipped (Phases 1 and 2 complete). The current scope:
 
 **Shipped:**
 - Audit subsystem (append-only, hash-chained event log)
@@ -1083,7 +1083,7 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 
 - **What**: A subsystem analogous to classification that runs quality checks (null rates, value distributions, referential integrity, etc.) against columns based on policy.
 - **Why deferred**: Phase 1 focuses on classification because it's the simpler pillar - rules return booleans. Quality rules need richer outputs (statistics, thresholds, severity levels). Building both at once would double the surface area to verify.
-- **Trigger to revisit**: Phase 2 of the project. Quality follows the same architectural pattern as classification (policy + engine + evaluators + audit), so the precedent is set.
+- **Trigger to revisit**: Phase 3 of the project. Quality follows the same architectural pattern as classification (policy + engine + evaluators + audit), so the precedent is set.
 
 ### Encryption engine
 
