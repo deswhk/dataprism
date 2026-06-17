@@ -12,18 +12,20 @@ the rendered output contains the expected information.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from dataprism.classification.candidates import TableCandidate
 from dataprism.classification.results import ClassificationResult
 from dataprism.classification.table import (
     ColumnError,
     FailedTable,
-    ScanResult,
+    ScanReport,
     TableClassificationReport,
 )
 from dataprism.cli.render import (
     render_candidates_json,
     render_candidates_text,
+    render_html_report,
     render_json,
     render_progress_complete_continuation,
     render_progress_error_continuation,
@@ -90,9 +92,27 @@ def _make_empty_report() -> TableClassificationReport:
     )
 
 
-def _make_clean_scan_result() -> ScanResult:
-    """A ScanResult with two successful tables, no failures."""
-    return ScanResult(
+def _dummy_scan_metadata() -> dict:
+    """Return placeholder ScanReport metadata kwargs.
+
+    The render tests are about the rendering of tables/failures, not
+    about the metadata fields themselves. Real values for scan_id,
+    started_at, completed_at are exercised in the engine tests.
+    """
+    now = datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc)
+    return {
+        "scan_id": "test-scan-id",
+        "started_at": now,
+        "completed_at": now,
+        "policy_name": None,
+        "target_summary": None,
+    }
+
+
+def _make_clean_scan_result() -> ScanReport:
+    """A ScanReport with two successful tables, no failures."""
+    return ScanReport(
+        **_dummy_scan_metadata(),
         tables=[
             TableClassificationReport(
                 table="users",
@@ -115,9 +135,10 @@ def _make_clean_scan_result() -> ScanResult:
     )
 
 
-def _make_mixed_scan_result() -> ScanResult:
-    """A ScanResult with one success and one failure."""
-    return ScanResult(
+def _make_mixed_scan_result() -> ScanReport:
+    """A ScanReport with one success and one failure."""
+    return ScanReport(
+        **_dummy_scan_metadata(),
         tables=[
             TableClassificationReport(
                 table="users",
@@ -430,8 +451,8 @@ class TestRenderScanSummary:
         assert "1 failed" in result
 
     def test_empty_scan_summary(self):
-        """An empty ScanResult summarizes to '0 tables' and 0 classifications."""
-        empty = ScanResult(tables=[], failed_tables=[])
+        """An empty ScanReport summarizes to '0 tables' and 0 classifications."""
+        empty = ScanReport(**_dummy_scan_metadata(), tables=[], failed_tables=[])
         result = render_scan_summary(empty)
         assert "0 tables" in result
         assert "0 classifications" in result
@@ -565,3 +586,315 @@ class TestRenderCandidatesJson:
         parsed = json.loads(result)
         assert parsed["total_tables"] == 0
         assert parsed["tables"] == []
+
+
+# =====================================================================
+# render_html_report tests
+# =====================================================================
+
+
+def _make_scan_with_metadata(
+    *,
+    policy_name: str | None = "example",
+    target_summary: str | None = "sqlite:///test.db",
+) -> ScanReport:
+    """A ScanReport with a couple of tables and explicit metadata."""
+    meta = _dummy_scan_metadata()
+    meta["policy_name"] = policy_name
+    meta["target_summary"] = target_summary
+    return ScanReport(
+        **meta,
+        tables=[
+            TableClassificationReport(
+                table="users",
+                columns_attempted=3,
+                matches_by_column={
+                    "id": [],
+                    "email": [_make_result("email", rule_name="email_pattern")],
+                    "name": [],
+                },
+                errors=[],
+            ),
+            TableClassificationReport(
+                table="orders",
+                columns_attempted=2,
+                matches_by_column={"id": [], "total": []},
+                errors=[],
+            ),
+        ],
+        failed_tables=[],
+    )
+
+
+class TestRenderHtmlReportContent:
+    """The HTML output contains expected information."""
+
+    def test_returns_string(self):
+        """Output is a str (caller is responsible for writing it)."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert isinstance(result, str)
+
+    def test_is_complete_html_document(self):
+        """Output begins with DOCTYPE and ends with </html>."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert result.startswith("<!DOCTYPE html>")
+        assert result.rstrip().endswith("</html>")
+
+    def test_includes_scan_id(self):
+        """The scan_id appears in the output (for cross-reference)."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "test-scan-id" in result  # from _dummy_scan_metadata
+
+    def test_includes_policy_name(self):
+        """The policy name appears in the output."""
+        result = render_html_report(_make_scan_with_metadata(policy_name="strict"))
+        assert "strict" in result
+
+    def test_omits_policy_name_when_none(self):
+        """When policy_name is None, the output says '(not specified)'."""
+        result = render_html_report(_make_scan_with_metadata(policy_name=None))
+        assert "(not specified)" in result
+
+    def test_includes_target_summary(self):
+        """The target summary appears in the output."""
+        result = render_html_report(
+            _make_scan_with_metadata(target_summary="postgresql://host:5432/db")
+        )
+        assert "postgresql://host:5432/db" in result
+
+    def test_includes_all_table_names(self):
+        """Each successfully classified table appears in the breakdown."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "users" in result
+        assert "orders" in result
+
+    def test_includes_classification_labels(self):
+        """The PII label appears for the email column."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert ">PII<" in result  # rendered inside a span
+
+    def test_includes_rule_name_for_matches(self):
+        """The rule name is shown for matching columns."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "email_pattern" in result
+
+    def test_includes_audit_log_path_when_provided(self):
+        """audit_log_path argument appears in the footer."""
+        result = render_html_report(
+            _make_scan_with_metadata(),
+            audit_log_path="/tmp/audit.jsonl",
+        )
+        assert "/tmp/audit.jsonl" in result
+
+    def test_omits_audit_log_path_when_not_provided(self):
+        """Without audit_log_path, the footer just shows scan_id."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "audit.jsonl" not in result
+        # Footer-line about verifying audit chain is also omitted
+        assert "dataprism audit verify" not in result
+
+
+class TestRenderHtmlReportSafety:
+    """Sensitive data is not introduced into the output."""
+
+    def test_no_evidence_field_leakage(self):
+        """ClassificationResult has no 'evidence' field; output shouldn't claim one."""
+        # If a future ClassificationResult adds evidence, this test catches
+        # the template silently exposing it.
+        result = render_html_report(_make_scan_with_metadata())
+        assert "evidence" not in result.lower()
+
+    def test_contains_no_data_values_disclaimer(self):
+        """Footer says no sampled values appear in the report."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "no sampled data values" in result
+
+    def test_passes_through_target_summary_as_given(self):
+        """Renderer doesn't redact; caller is responsible for redaction."""
+        # If a caller passes a DSN with a real password, the renderer
+        # outputs it verbatim. This is by design and documented.
+        result = render_html_report(
+            _make_scan_with_metadata(target_summary="postgresql://user:NOT_REDACTED@host:5432/db")
+        )
+        # We're verifying the renderer doesn't second-guess the caller.
+        # In real use, the CLI passes the redacted DSN already.
+        assert "NOT_REDACTED" in result
+
+
+class TestRenderHtmlReportFailures:
+    """Failed tables and per-column errors render correctly."""
+
+    def test_failed_table_appears_in_errors_section(self):
+        """A FailedTable name and error message appear in the Errors section."""
+        meta = _dummy_scan_metadata()
+        report = ScanReport(
+            **meta,
+            tables=[],
+            failed_tables=[FailedTable(name="ghost_table", error="Table not found")],
+        )
+        result = render_html_report(report)
+        assert "ghost_table" in result
+        assert "Table not found" in result
+        assert "Errors" in result
+
+    def test_no_errors_section_when_clean_run(self):
+        """A scan with no failures/per-column-errors has no Errors heading."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "<h2>Errors</h2>" not in result
+
+    def test_failed_table_count_in_header(self):
+        """The header shows the failed-tables count in parentheses."""
+        meta = _dummy_scan_metadata()
+        report = ScanReport(
+            **meta,
+            tables=[],
+            failed_tables=[
+                FailedTable(name="a", error="x"),
+                FailedTable(name="b", error="y"),
+            ],
+        )
+        result = render_html_report(report)
+        assert "2 failed" in result
+
+
+class TestRenderHtmlReportEmpty:
+    """Edge cases: empty scan, no classifications, etc."""
+
+    def test_empty_scan_renders_without_error(self):
+        """A ScanReport with no tables and no failures still renders."""
+        meta = _dummy_scan_metadata()
+        report = ScanReport(**meta, tables=[], failed_tables=[])
+        result = render_html_report(report)
+        assert isinstance(result, str)
+        assert result.startswith("<!DOCTYPE html>")
+
+    def test_empty_scan_shows_zero_tables_in_summary(self):
+        """The executive summary table shows 0 tables scanned."""
+        meta = _dummy_scan_metadata()
+        report = ScanReport(**meta, tables=[], failed_tables=[])
+        result = render_html_report(report)
+        # We can't grep for "0" alone (it's everywhere), so look for a
+        # known phrase that appears when there are no tables.
+        assert "No tables were successfully scanned" in result
+
+    def test_no_classifications_shows_friendly_message(self):
+        """A scan where no columns matched shows the empty-category message."""
+        meta = _dummy_scan_metadata()
+        report = ScanReport(
+            **meta,
+            tables=[
+                TableClassificationReport(
+                    table="orders",
+                    columns_attempted=2,
+                    matches_by_column={"id": [], "total": []},
+                    errors=[],
+                ),
+            ],
+            failed_tables=[],
+        )
+        result = render_html_report(report)
+        assert "No columns matched any classification rule" in result
+
+
+class TestRenderHtmlReportCategories:
+    """Color-coded category classes appear when those categories are present."""
+
+    def test_pii_category_uses_pii_class(self):
+        """A PII match produces a label-pii CSS class in the output."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "label-pii" in result
+
+    def test_financial_category_uses_financial_class(self):
+        """A FINANCIAL match produces a label-financial CSS class."""
+        meta = _dummy_scan_metadata()
+        fin_match = ClassificationResult(
+            column_name="account_no",
+            classification="FINANCIAL",
+            rule_name="account_pattern",
+            rule_type="regex",
+        )
+        report = ScanReport(
+            **meta,
+            tables=[
+                TableClassificationReport(
+                    table="accounts",
+                    columns_attempted=1,
+                    matches_by_column={"account_no": [fin_match]},
+                    errors=[],
+                ),
+            ],
+            failed_tables=[],
+        )
+        result = render_html_report(report)
+        assert "label-financial" in result
+
+    def test_unknown_category_falls_back_gracefully(self):
+        """An unfamiliar category renders without crashing (uses lowercase class)."""
+        meta = _dummy_scan_metadata()
+        unusual_match = ClassificationResult(
+            column_name="x",
+            classification="QUIRKY",
+            rule_name="r",
+            rule_type="regex",
+        )
+        report = ScanReport(
+            **meta,
+            tables=[
+                TableClassificationReport(
+                    table="t",
+                    columns_attempted=1,
+                    matches_by_column={"x": [unusual_match]},
+                    errors=[],
+                ),
+            ],
+            failed_tables=[],
+        )
+        result = render_html_report(report)
+        assert "label-quirky" in result
+        assert "QUIRKY" in result
+
+
+class TestRenderHtmlReportStructure:
+    """Output structure - sections present, well-formed HTML."""
+
+    def test_contains_header_section(self):
+        """The header card with timestamps and policy is present."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "dataprism Scan Report" in result
+        assert "Completed:" in result
+
+    def test_contains_executive_summary(self):
+        """The Executive summary section is present."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "Executive summary" in result
+
+    def test_contains_per_table_breakdown(self):
+        """The Per-table breakdown section is present."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "Per-table breakdown" in result
+
+    def test_contains_policy_collapsible(self):
+        """The policy section is in a details/summary element."""
+        result = render_html_report(_make_scan_with_metadata())
+        assert "<details>" in result
+        assert "Policy used" in result
+
+    def test_contains_footer_with_scan_id(self):
+        """Footer contains the scan_id."""
+        result = render_html_report(_make_scan_with_metadata())
+        # The footer wraps the scan_id; look for the surrounding context.
+        assert "Scan ID:" in result
+
+    def test_duration_appears_in_header(self):
+        """The duration (seconds) appears in the header."""
+        result = render_html_report(_make_scan_with_metadata())
+        # _dummy_scan_metadata uses started == completed, so duration = 0.00
+        assert "0.00s" in result
+
+    def test_html_is_self_contained(self):
+        """No external CSS or JS references."""
+        result = render_html_report(_make_scan_with_metadata())
+        # No <link> tags for external CSS
+        assert "<link" not in result.lower()
+        # No <script> tags
+        assert "<script" not in result.lower()
