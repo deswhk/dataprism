@@ -6,7 +6,7 @@ tagging) with support for PostgreSQL and planned support for MySQL, SQL Server, 
 
 ## Status
 
-Phase 1 complete. Phase 2 in progress.
+Phases 1 and 2 complete. Phase 3 not started.
 
 **Shipped:**
 - Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
