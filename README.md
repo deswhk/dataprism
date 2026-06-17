@@ -11,12 +11,10 @@ Phase 1 complete. Phase 2 in progress.
 **Shipped:**
 - Audit logging (tamper-evident, append-only event log with SHA-256 hash chaining)
 - Policy engine (YAML-driven rules validated against Pydantic schemas)
-- Classification (regex, dictionary, statistical classifiers; `classify_table` for single tables, `classify_tables` for batches, `list_table_candidates` for cheap pre-scan discovery)
+- Classification (regex, dictionary, statistical classifiers; `classify_table` for single tables, `classify_tables` for batches returning a self-contained `ScanReport`, `list_table_candidates` for cheap pre-scan discovery)
 - Database adapters (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
 - Command-line interface (`dataprism table classify` with one-or-many `--table`, `dataprism table candidates`, `dataprism audit verify`)
-
-**In progress (v2):**
-- HTML report generation
+- HTML scan reports (one self-contained file per classify run, written to `<project-root>/reports/`)
 
 **Deferred to later phases:**
 - Quality engine, encryption, retention pillars
@@ -81,7 +79,13 @@ The output shows all tables sorted by how many columns match the policy's name-b
 dataprism table candidates --policy example --output json
 ```
 
-Every classification appends to the audit log at `audit/audit.jsonl`. Verify the chain is intact:
+Every classification produces two artifacts:
+- A line-by-line event sequence appended to the audit log at `audit/audit.jsonl` (tamper-evident).
+- A self-contained HTML scan report at `reports/<YYYY-MM-DD-HHMMSS>.html` (open in any browser; share or print as a governance artifact).
+
+The HTML report's footer carries the scan's `scan_id`, which matches the `SCAN_STARTED`/`SCAN_COMPLETED` events in the audit log - so a reviewer can pull the report and the matching audit slice side by side.
+
+Verify the audit chain is intact:
 
 ```powershell
 dataprism audit verify

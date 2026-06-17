@@ -55,12 +55,9 @@ This is **v2** in progress (Phase 1 complete, Phase 2 in active development). Th
 **Shipped:**
 - Audit subsystem (append-only, hash-chained event log)
 - Policy subsystem (YAML schema + validation + audit integration)
-- Classification subsystem (regex, dictionary, statistical rule evaluators; `classify_table` for single tables; `classify_tables` for batch scans with SCAN_STARTED/SCAN_COMPLETED audit bookends; `list_table_candidates` for cheap pre-scan discovery)
+- Classification subsystem (regex, dictionary, statistical rule evaluators; `classify_table` for single tables; `classify_tables` for batch scans returning a `ScanReport` with metadata, SCAN_STARTED/SCAN_COMPLETED audit bookends, and shared scan_id; `list_table_candidates` for cheap pre-scan discovery)
 - Adapters subsystem (`DatabaseAdapter` Protocol + `SqliteAdapter` + `PostgresAdapter`)
-- CLI subsystem (`dataprism table classify` with comma-separated `--table`; `dataprism table candidates`; `dataprism audit verify`)
-
-**In progress (v2):**
-- HTML report generation (Jinja2-rendered scan reports; written alongside every classify run)
+- CLI subsystem (`dataprism table classify` with comma-separated `--table`; `dataprism table candidates`; `dataprism audit verify`; HTML scan reports written to `<project-root>/reports/`)
 
 **Deferred (Phase 3 and beyond):**
 - Quality engine pillar
@@ -498,7 +495,7 @@ Apply policy rules to columns and return matches. The subsystem exposes APIs at 
 
 - **`ClassificationEngine.classify(column_name, values)`** - the per-column workhorse. Given a loaded `ClassificationPolicy` and a column (its name plus optional sample values), the engine evaluates every rule and returns one `ClassificationResult` per match. Every call records a `CLASSIFICATION_RUN` audit event.
 - **`classify_table(adapter, table, policy, audit)`** - the single-table convenience. Combines a `DatabaseAdapter` with the engine to classify every column in one call. Emits `TABLE_CLASSIFICATION_STARTED`/`TABLE_CLASSIFICATION_COMPLETED` events around the per-column work, collects per-column errors in a `TableClassificationReport`, and returns the full picture.
-- **`classify_tables(adapter, tables, policy, audit)`** - the multi-table sibling. Loops over `classify_table` for each input, catching per-table failures into a `failed_tables` list rather than aborting the run. Emits `SCAN_STARTED`/`SCAN_COMPLETED` bookend events with a shared `scan_id` so the audit log can cross-reference all activity from one batch invocation. Returns a `ScanResult` (the per-table reports + failures). Accepts optional progress callbacks (`on_table_start`, `on_table_complete`, `on_table_failed`) so callers (like the CLI) can stream incremental output without the engine needing to know about stdout.
+- **`classify_tables(adapter, tables, policy, audit)`** - the multi-table sibling. Loops over `classify_table` for each input, catching per-table failures into a `failed_tables` list rather than aborting the run. Emits `SCAN_STARTED`/`SCAN_COMPLETED` bookend events with a shared `scan_id` so the audit log can cross-reference all activity from one batch invocation. Returns a `ScanReport` containing the per-table reports, per-table failures, and scan-level metadata (`scan_id`, `started_at`, `completed_at`, optional `policy_name`, optional `target_summary`). The metadata makes the ScanReport a self-contained governance artifact suitable for rendering as HTML. Accepts optional progress callbacks (`on_table_start`, `on_table_complete`, `on_table_failed`) so callers (like the CLI) can stream incremental output without the engine needing to know about stdout. The CLI always calls `classify_tables` (even for single-table requests) so every scan produces the same shape and benefits from the audit-log cross-reference.
 - **`list_table_candidates(adapter, policy, schema=None)`** - the pre-scan discovery API. Walks every table in scope and counts how many columns match the policy's *name-based* rules (regex with `target=column_name`; dictionary). Statistical and value-target rules are deliberately skipped (they would require sampling, defeating the point of a cheap pre-scan). Returns a list of `TableCandidate`, sorted by match count descending then name ascending, so the user sees likely scan targets first. Output is a heuristic, not a guarantee: a 0-match table may still contain sensitive data in oddly-named columns.
 
 This is the first subsystem that *does* something with data, as opposed to defining or storing rules. Audit is the substrate and policy is the language; classification is the first real application.
@@ -927,6 +924,34 @@ Statistical and value-target regex rules are deliberately skipped because evalua
 
 The text format is for terminal reading; the JSON format is for scripting workflows (e.g., extract names of tables with matches, pipe back into `classify --table`).
 
+**HTML scan report written for every classify run**
+
+Every `dataprism table classify` invocation writes a self-contained HTML report to `<project-root>/reports/<YYYY-MM-DD-HHMMSS>.html`. The report includes:
+
+- **Header**: scan timestamp, duration, policy name, target database (with the DSN's password redacted for safety).
+- **Executive summary**: tables scanned, tables failed, columns examined, columns classified, plus a breakdown by category (PII, FINANCIAL, etc).
+- **Per-table breakdown**: each scanned table with its columns, classifications (color-coded by category), and matching rules. Tables with no matches are visually collapsed.
+- **Errors**: failed tables (whole-table failures) and any per-column errors.
+- **Policy used**: collapsed details element with the policy name.
+- **Footer**: scan_id (matching the audit log's `SCAN_STARTED`/`SCAN_COMPLETED` events), the audit log path, and the `dataprism audit verify` reminder.
+
+Design choices:
+
+- *Self-contained single file*. Inline CSS, no JavaScript, no external assets. The reviewer can open, share, or print without any infrastructure.
+- *Jinja2 rendered*. The template lives at `cli/templates/report.html.j2`. Two output formats (text/JSON) are still produced by Python functions in `cli/render.py`; only the HTML report uses Jinja2 (it's large enough to warrant a template engine).
+- *Always written*. Even single-table failures and JSON output runs produce an HTML report - the report is a governance artifact, not a display format. JSON callers get the HTML written silently (no `Report:` trailer in stdout, so JSON remains parseable).
+- *Password redaction*. The CLI redacts the DSN's password (replacing it with `***`) via `cli/adapters.py::redact_dsn_for_display` before passing it to `classify_tables` as `target_summary`. The renderer doesn't re-redact; the caller is responsible.
+- *No sampled data values*. The report contains column names, classification labels, rule names, and rule types - but not the actual sampled values that triggered each match. (The `ClassificationResult` model doesn't carry sampled values; this is a Pydantic-enforced safety property.)
+- *Cross-referenced with audit log*. The footer's scan_id matches the `scan_id` recorded on `SCAN_STARTED`/`SCAN_COMPLETED` audit events. A reviewer can pull up the report and the audit log side by side.
+
+**Per-table failures are findings, not program errors (exit codes)**
+
+PR 10's single-table classify exited with code 1 when the requested table didn't exist (because the engine raised `AdapterError`). PR 11 introduced multi-table classify, which caught per-table failures into a `failed_tables` list and exited 0. PR 12 corrects the single-table path to match: a missing table or denied permission is a *finding* (the program ran, it just didn't find what the user expected), not a *program* failure. The failure is surfaced on stderr for terminal visibility, documented in the HTML report's Errors section, and recorded in the audit log - but the exit code is 0.
+
+Non-zero exit codes are reserved for:
+- **1**: program-level runtime failures (database connection refused, audit chain broken).
+- **2**: misuse (DATAPRISM_DSN unset, policy file not found, audit log missing for verify).
+
 **Env-var-only DSN; explicit policy and output flags**
 
 The DSN is read exclusively from `DATAPRISM_DSN`. There is no `--dsn` CLI flag. Two reasons:
@@ -1028,7 +1053,6 @@ In JSON mode, only the JSON document goes to stdout - no "Audit log: ..." traile
 - **Self-contained project model only**: dataprism cannot be `pip install`ed yet. Source must be cloned. The path-resolution approach (walk up from `__file__`) breaks in `site-packages/`. See deferred decisions for the workspace model.
 - **Two output formats**: text and JSON. Adding more (HTML, Markdown, CSV) would benefit from a template engine; deferred.
 - **No CLI config file**: each invocation reads its own env vars and flags. If a user wants the same `--policy` for many commands, they retype it. Deferred until friction is observed.
-- **No HTML report yet**: every `classify` run could produce a persistent artifact for governance review. Currently the user gets terminal output only. HTML report generation is the focus of PR 12.
 - **No schema-level batch operation**: `dataprism table classify --table T1,T2,T3` operates on a list the user specifies. `dataprism table candidates` helps the user discover what to put in that list, but there is no `--schema sales` shortcut that scans every table in a schema. Deliberate scope choice (see the "you specify what to scan" framing in section 1) - revisit if usage patterns suggest otherwise.
 - **No completion auto-generated for the user**: Typer supports shell completion via `--install-completion`, but dataprism doesn't promote this in docs or README. It works, but as an advanced feature.
 
@@ -1077,9 +1101,10 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 
 ### Template engine for richer rendering
 
-- **What**: A template engine (Jinja2 or similar) for rendering classification results, replacing the current Python render functions in `cli/render.py`. Would enable richer output formats (HTML reports, CSV exports, Markdown summaries, customizable layouts).
-- **Why deferred**: v2's CLI ships with two formats — text and JSON — produced by short Python functions (~30 lines each). Jinja2 would add a dependency, a templates directory, and a template-loading layer for marginal value at this scale. Python functions are cheaper and easier to reason about for two output formats.
-- **Trigger to revisit**: When a third format is needed (HTML for sharing with non-technical stakeholders is the most likely), OR when users want to customize the layout per deployment. At that point, migrate `render_text` and `render_json` to load `text.j2` and `json.j2` templates respectively, and add new formats as new templates.
+- **What**: A template engine (Jinja2 or similar) for rendering classification results. Originally deferred entirely; partially activated in PR 12.
+- **Activated for HTML reports (PR 12)**: HTML output is rendered via `cli/templates/report.html.j2` using Jinja2. The template is large enough (200+ lines including inline CSS) that string-composing it in Python would be unmaintainable.
+- **Still deferred for text/JSON output**: `render_text`, `render_json`, `render_scan_summary`, `render_candidates_*`, and the multi-table progress renderers remain short Python functions. They're each ~10-30 lines and don't benefit from template extraction. Migration to templates would be straightforward if a deployment needs per-customer customization, but no use case has emerged.
+- **Trigger for further activation**: When users need to customize text/JSON layouts per deployment, OR when a new output format (CSV, Markdown, additional HTML variants) is requested. At that point, migrate the affected renderers to templates and add new formats as new templates.
 
 ### PyPI distribution / workspace model
 
