@@ -1048,6 +1048,22 @@ Success output (the report, the verification result) goes to stdout. Error messa
 
 In JSON mode, only the JSON document goes to stdout - no "Audit log: ..." trailer. This keeps the output safely pipeable to `jq`, `ConvertFrom-Json`, or any JSON consumer. Text mode includes the audit log path as a human convenience after the report.
 
+**Shared test helpers in `tests/conftest.py`**
+
+Tests across the `classification/`, `cli/`, and other subpackages used to maintain local copies of small factory helpers (rule constructors, policy builders, audit setups, DB fixtures). PR 13 consolidated these into a single project-level `tests/conftest.py` as factory-style pytest fixtures:
+
+- Rule factories: `make_dict_rule`, `make_regex_rule`, `make_statistical_rule`
+- Policy factory: `make_policy`
+- Audit setup: `make_audit_setup`
+- Engine factory: `make_engine` (composes the above)
+- Database fixtures: `make_users_db_dsn`, `make_multi_table_db_dsn`
+
+Each fixture yields a factory function the test calls with its own arguments. Tests opt in by adding the fixture as a parameter: `def test_X(make_dict_rule, make_engine):`. This is the standard pytest fixture pattern — no `tests/__init__.py` was needed.
+
+Two scopes of helpers stay local to their test module: (a) module-specific factories (e.g., `make_connected_sqlite` in `test_table.py`, which wraps `make_users_db_dsn` to also build an adapter), and (b) helpers tied to a specific subpackage's testing concerns (`tests/adapters/fixtures.py` retains plain functions with a different schema specifically for adapter tests; `_strip_ansi` in `test_main.py` is CLI-only).
+
+The conftest pattern scales: a new shared helper goes in `tests/conftest.py`; a new module-specific helper stays in the test module. The boundary is "is this used in two or more files?"
+
 ### Limitations
 
 - **Self-contained project model only**: dataprism cannot be `pip install`ed yet. Source must be cloned. The path-resolution approach (walk up from `__file__`) breaks in `site-packages/`. See deferred decisions for the workspace model.
@@ -1153,12 +1169,6 @@ The structure is consistent: what was deferred, why, what triggers revisiting.
 - **What**: Compiled-regex caching, parallel rule evaluation, batch classification, lazy iteration over large value lists.
 - **Why deferred**: No measurements indicate they're needed. Premature optimization is widely known to be a mistake; speculative optimization is its quieter cousin.
 - **Trigger to revisit**: When profiling shows classification is the bottleneck in a real deployment. Then optimize the specific hot path, not "everything that might be slow."
-
-### Test helper consolidation
-
-- **What**: Test helpers like `_dict_rule`, `_regex_rule`, and the `users`-database fixture are duplicated across multiple test files. After PR 11, the duplication spans `tests/classification/test_engine.py`, `tests/classification/test_table.py` (which also has a multi-table fixture), `tests/classification/test_candidates.py` (added in PR 11), and `tests/cli/test_main.py` (which has both single- and multi-table CLI fixtures). Combined duplication is now over 150 lines.
-- **Why deferred**: Each new test file added the local copies it needed rather than reach across subpackages. `pytest` subpackages don't share fixtures by default (no `tests/__init__.py`). Extracting shared helpers would require either restructuring the tests directory or creating a top-level `tests/conftest.py` with the helpers as fixtures. Both broaden the PR that does it. PR 11 doubled the duplication without resolving it - making the deferral cost more visible.
-- **Trigger to revisit**: The original trigger ((a) "fourth test subpackage needs the same helpers") **has fired** as of PR 11 (`test_candidates.py` is the fourth). The deferral now persists deliberately because PR 11's scope is multi-table classify, not test-infra refactor. A dedicated cleanup PR after PR 12 is the right home for this work. The work itself: extract helpers into `tests/conftest.py` (project-wide), update existing tests to use the fixtures via dependency injection, remove the local copies.
 
 ### General pattern: the YAGNI commitment
 

@@ -29,8 +29,6 @@ from dataprism.adapters.protocol import (
 )
 from dataprism.adapters.sqlite import SqliteAdapter
 from dataprism.audit.events import EventType
-from dataprism.audit.service import AuditService
-from dataprism.audit.storage import InMemoryStorage
 from dataprism.classification.table import (
     FailedTable,
     ScanReport,
@@ -40,11 +38,6 @@ from dataprism.classification.table import (
 )
 from dataprism.policy.models import (
     ClassificationLabel,
-    ClassificationPolicy,
-    DictionaryMatchMode,
-    DictionaryRule,
-    RegexRule,
-    RegexTarget,
 )
 
 # ---- Test helpers ---------------------------------------------------
@@ -61,152 +54,36 @@ from dataprism.policy.models import (
 # consolidation".
 
 
-def _make_audit_setup(
-    actor: str = "classify_table",
-) -> tuple[AuditService, InMemoryStorage]:
-    """Return (AuditService, InMemoryStorage) for inspecting audit events."""
-    storage = InMemoryStorage()
-    audit = AuditService(storage)
-    return audit, storage
+@pytest.fixture
+def make_connected_sqlite(make_users_db_dsn):
+    """Module-local fixture: returns a factory for a connected SqliteAdapter.
 
-
-def _dict_rule(
-    name: str,
-    values: list[str],
-    classification: ClassificationLabel = ClassificationLabel.PII,
-) -> DictionaryRule:
-    return DictionaryRule(
-        type="dictionary",
-        name=name,
-        values=values,
-        match_mode=DictionaryMatchMode.EXACT_NORMALIZED,
-        classification=classification,
-    )
-
-
-def _regex_rule(
-    name: str,
-    target: RegexTarget,
-    pattern: str,
-    classification: ClassificationLabel = ClassificationLabel.PII,
-) -> RegexRule:
-    return RegexRule(
-        type="regex",
-        name=name,
-        target=target,
-        pattern=pattern,
-        classification=classification,
-    )
-
-
-def _make_users_db(tmp_path) -> str:
-    """Create a SQLite users database for classification tests.
-
-    Local copy of make_users_db from tests/adapters/fixtures.py.
-    Duplicated here because pytest test subpackages don't share
-    fixtures (no tests/__init__.py). Documented in docs/ARCHITECTURE.md
-    Section 8 'Test helper consolidation'.
-
-    Schema:
-        users (id INTEGER, email TEXT, name TEXT, active INTEGER, score REAL)
-        - 5 rows, one with NULL name and NULL score
+    Uses make_users_db_dsn from conftest under the hood. Tests pass
+    tmp_path; the fixture creates the DB, connects, and returns the
+    adapter. Tests are responsible for calling adapter.close() in a
+    try/finally.
     """
-    from sqlalchemy import create_engine, text
 
-    dsn = f"sqlite:///{tmp_path / 'test.db'}"
-    engine = create_engine(dsn)
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "CREATE TABLE users ("
-                    "id INTEGER, email TEXT, name TEXT, "
-                    "active INTEGER, score REAL)"
-                )
-            )
-            conn.execute(
-                text("INSERT INTO users VALUES (1, 'alice@example.com', 'Alice', 1, 99.5)")
-            )
-            conn.execute(text("INSERT INTO users VALUES (2, 'bob@example.com', NULL, 0, NULL)"))
-            conn.execute(
-                text("INSERT INTO users VALUES (3, 'charlie@example.com', 'Charlie', 1, 87.2)")
-            )
-            conn.execute(
-                text("INSERT INTO users VALUES (4, 'diana@example.com', 'Diana', 1, 92.0)")
-            )
-            conn.execute(text("INSERT INTO users VALUES (5, 'eve@example.com', 'Eve', 0, 50.5)"))
-    finally:
-        engine.dispose()
-    return dsn
+    def _make(tmp_path):
+        dsn = make_users_db_dsn(tmp_path / "test.db")
+        adapter = SqliteAdapter()
+        adapter.connect(dsn)
+        return adapter
 
-
-def _make_multi_table_db(tmp_path) -> str:
-    """Create a SQLite database with multiple tables for multi-table tests.
-
-    Schema:
-        users (id, email, name, active, score)         - 5 rows
-        orders (id, customer_id, total)                - 3 rows
-        products (id, sku, name, price)                - 3 rows
-    """
-    from sqlalchemy import create_engine, text
-
-    dsn = f"sqlite:///{tmp_path / 'multi.db'}"
-    engine = create_engine(dsn)
-    try:
-        with engine.begin() as conn:
-            # users
-            conn.execute(
-                text(
-                    "CREATE TABLE users ("
-                    "id INTEGER, email TEXT, name TEXT, "
-                    "active INTEGER, score REAL)"
-                )
-            )
-            conn.execute(text("INSERT INTO users VALUES (1, 'a@example.com', 'Alice', 1, 99.5)"))
-            conn.execute(text("INSERT INTO users VALUES (2, 'b@example.com', 'Bob', 1, 88.0)"))
-            conn.execute(text("INSERT INTO users VALUES (3, 'c@example.com', 'Carol', 1, 77.5)"))
-            conn.execute(text("INSERT INTO users VALUES (4, 'd@example.com', 'Dan', 0, 66.0)"))
-            conn.execute(text("INSERT INTO users VALUES (5, 'e@example.com', 'Eve', 1, 55.5)"))
-
-            # orders
-            conn.execute(text("CREATE TABLE orders (id INTEGER, customer_id INTEGER, total REAL)"))
-            conn.execute(text("INSERT INTO orders VALUES (1, 1, 49.99)"))
-            conn.execute(text("INSERT INTO orders VALUES (2, 2, 19.50)"))
-            conn.execute(text("INSERT INTO orders VALUES (3, 3, 75.00)"))
-
-            # products
-            conn.execute(
-                text("CREATE TABLE products (id INTEGER, sku TEXT, name TEXT, price REAL)")
-            )
-            conn.execute(text("INSERT INTO products VALUES (1, 'A-001', 'Widget', 9.99)"))
-            conn.execute(text("INSERT INTO products VALUES (2, 'A-002', 'Gadget', 19.99)"))
-            conn.execute(text("INSERT INTO products VALUES (3, 'A-003', 'Sprocket', 4.49)"))
-    finally:
-        engine.dispose()
-    return dsn
-
-
-def _make_policy(rules: list) -> ClassificationPolicy:
-    return ClassificationPolicy(version=1, classifiers=rules)
-
-
-def _connect_sqlite(tmp_path) -> SqliteAdapter:
-    """Create a SqliteAdapter against a users database and return it connected."""
-    dsn = _make_users_db(tmp_path)  # changed from make_users_db
-    adapter = SqliteAdapter()
-    adapter.connect(dsn)
-    return adapter
+    return _make
 
 
 class TestClassifyTableHappyPath:
     """Verify the happy path: all columns classify, report is well-formed."""
 
-    def test_returns_table_classification_report(self, tmp_path):
+    def test_returns_table_classification_report(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """classify_table returns a TableClassificationReport."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("email_columns", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_columns", ["email"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -215,13 +92,15 @@ class TestClassifyTableHappyPath:
         finally:
             adapter.close()
 
-    def test_columns_attempted_matches_table(self, tmp_path):
+    def test_columns_attempted_matches_table(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """columns_attempted equals the number of columns in the table."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
             # users table has 5 columns: id, email, name, active, score
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -229,12 +108,14 @@ class TestClassifyTableHappyPath:
         finally:
             adapter.close()
 
-    def test_matches_by_column_includes_all_columns(self, tmp_path):
+    def test_matches_by_column_includes_all_columns(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """Every column appears in matches_by_column (empty list if no matches)."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("email_columns", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_columns", ["email"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -243,16 +124,18 @@ class TestClassifyTableHappyPath:
         finally:
             adapter.close()
 
-    def test_matching_column_has_results(self, tmp_path):
+    def test_matching_column_has_results(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """A column matching a rule produces non-empty results."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy(
+            policy = make_policy(
                 [
-                    _dict_rule("email_columns", ["email"], ClassificationLabel.PII),
+                    make_dict_rule("email_columns", ["email"], ClassificationLabel.PII),
                 ]
             )
-            audit, _ = _make_audit_setup()
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -261,12 +144,14 @@ class TestClassifyTableHappyPath:
         finally:
             adapter.close()
 
-    def test_non_matching_column_has_empty_results(self, tmp_path):
+    def test_non_matching_column_has_empty_results(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """A column with no rules matching produces an empty list."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("email_columns", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_columns", ["email"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -275,12 +160,14 @@ class TestClassifyTableHappyPath:
         finally:
             adapter.close()
 
-    def test_no_errors_on_clean_run(self, tmp_path):
+    def test_no_errors_on_clean_run(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """A successful run returns an empty errors list."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("email_columns", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_columns", ["email"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -292,12 +179,14 @@ class TestClassifyTableHappyPath:
 class TestAuditEvents:
     """Verify the audit instrumentation: STARTED/COMPLETED bookends + per-column events."""
 
-    def test_emits_started_event(self, tmp_path):
+    def test_emits_started_event(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """TABLE_CLASSIFICATION_STARTED is emitted at the start."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit)
 
@@ -308,12 +197,14 @@ class TestAuditEvents:
         finally:
             adapter.close()
 
-    def test_emits_completed_event(self, tmp_path):
+    def test_emits_completed_event(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """TABLE_CLASSIFICATION_COMPLETED is emitted at the end."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit)
 
@@ -325,12 +216,14 @@ class TestAuditEvents:
         finally:
             adapter.close()
 
-    def test_emits_per_column_classification_run_events(self, tmp_path):
+    def test_emits_per_column_classification_run_events(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """Each successful column emits a CLASSIFICATION_RUN event (from the engine)."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit)
 
@@ -353,12 +246,14 @@ class TestAuditEvents:
         finally:
             adapter.close()
 
-    def test_event_order_bookend_pattern(self, tmp_path):
+    def test_event_order_bookend_pattern(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """Events follow the order: STARTED, [per-column], COMPLETED."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit)
 
@@ -372,12 +267,14 @@ class TestAuditEvents:
         finally:
             adapter.close()
 
-    def test_actor_propagates_to_all_events(self, tmp_path):
+    def test_actor_propagates_to_all_events(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """A custom actor appears on all events (STARTED, per-column, COMPLETED)."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit, actor="custom-actor")
 
@@ -387,12 +284,14 @@ class TestAuditEvents:
         finally:
             adapter.close()
 
-    def test_default_actor_is_classify_table(self, tmp_path):
+    def test_default_actor_is_classify_table(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """Without explicit actor, events have actor='classify_table'."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, storage = make_audit_setup()
 
             classify_table(adapter, "users", policy, audit)
 
@@ -428,12 +327,14 @@ class TestReportShape:
                 unknown_field="oops",  # type: ignore[call-arg]
             )
 
-    def test_consistency_invariant(self, tmp_path):
+    def test_consistency_invariant(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_connected_sqlite
+    ):
         """len(matches_by_column) + len(errors) == columns_attempted."""
-        adapter = _connect_sqlite(tmp_path)
+        adapter = make_connected_sqlite(tmp_path)
         try:
-            policy = _make_policy([_dict_rule("anything", ["x"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("anything", ["x"])])
+            audit, _ = make_audit_setup()
 
             result = classify_table(adapter, "users", policy, audit)
 
@@ -445,7 +346,9 @@ class TestReportShape:
 class TestErrorHandling:
     """Verify error propagation and per-column error collection."""
 
-    def test_list_columns_failure_propagates(self, tmp_path):
+    def test_list_columns_failure_propagates(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup
+    ):
         """If list_columns fails, classify_table raises and emits NO audit events."""
 
         class BrokenListColumnsAdapter:
@@ -466,8 +369,8 @@ class TestErrorHandling:
             def sample_values(self, table, column, n=1000, strategy=None):
                 raise AssertionError("Should not be called")
 
-        policy = _make_policy([_dict_rule("anything", ["x"])])
-        audit, storage = _make_audit_setup()
+        policy = make_policy([make_dict_rule("anything", ["x"])])
+        audit, storage = make_audit_setup()
 
         with pytest.raises(AdapterQueryError):
             classify_table(
@@ -481,7 +384,9 @@ class TestErrorHandling:
         events = list(storage.read_all())
         assert events == []
 
-    def test_per_column_sample_failure_collected_in_errors(self, tmp_path):
+    def test_per_column_sample_failure_collected_in_errors(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup
+    ):
         """An AdapterError during sample_values is caught and recorded."""
         from dataprism.adapters.protocol import ColumnInfo
 
@@ -524,8 +429,8 @@ class TestErrorHandling:
                     sample_size_actual=1,
                 )
 
-        policy = _make_policy([_dict_rule("anything", ["x"])])
-        audit, storage = _make_audit_setup()
+        policy = make_policy([make_dict_rule("anything", ["x"])])
+        audit, storage = make_audit_setup()
 
         result = classify_table(
             BrokenSampleAdapter(),  # type: ignore[arg-type]
@@ -562,7 +467,9 @@ class TestErrorHandling:
 class TestSamplingParameters:
     """Verify sample_size and strategy parameters propagate to the adapter."""
 
-    def test_default_sample_size_is_1000(self, tmp_path):
+    def test_default_sample_size_is_1000(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup
+    ):
         """Default sample_size=1000 is forwarded to sample_values."""
         captured = []
 
@@ -595,8 +502,8 @@ class TestSamplingParameters:
                     sample_size_actual=0,
                 )
 
-        policy = _make_policy([_dict_rule("anything", ["x"])])
-        audit, _ = _make_audit_setup()
+        policy = make_policy([make_dict_rule("anything", ["x"])])
+        audit, _ = make_audit_setup()
 
         classify_table(
             CapturingAdapter(),  # type: ignore[arg-type]
@@ -607,7 +514,9 @@ class TestSamplingParameters:
 
         assert captured[0]["n"] == 1000
 
-    def test_default_strategy_is_sequential(self, tmp_path):
+    def test_default_strategy_is_sequential(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup
+    ):
         """Default strategy=SamplingStrategy.SEQUENTIAL is forwarded."""
         captured = []
 
@@ -638,8 +547,8 @@ class TestSamplingParameters:
                     sample_size_actual=0,
                 )
 
-        policy = _make_policy([_dict_rule("anything", ["x"])])
-        audit, _ = _make_audit_setup()
+        policy = make_policy([make_dict_rule("anything", ["x"])])
+        audit, _ = make_audit_setup()
 
         classify_table(
             CapturingAdapter(),  # type: ignore[arg-type]
@@ -650,7 +559,9 @@ class TestSamplingParameters:
 
         assert captured[0]["strategy"] == SamplingStrategy.SEQUENTIAL
 
-    def test_custom_parameters_propagate(self, tmp_path):
+    def test_custom_parameters_propagate(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup
+    ):
         """Custom sample_size and strategy are forwarded to sample_values."""
         captured = []
 
@@ -681,8 +592,8 @@ class TestSamplingParameters:
                     sample_size_actual=0,
                 )
 
-        policy = _make_policy([_dict_rule("anything", ["x"])])
-        audit, _ = _make_audit_setup()
+        policy = make_policy([make_dict_rule("anything", ["x"])])
+        audit, _ = make_audit_setup()
 
         classify_table(
             CapturingAdapter(),  # type: ignore[arg-type]
@@ -705,27 +616,31 @@ class TestSamplingParameters:
 class TestClassifyTablesHappyPath:
     """Multi-table classify_tables happy path - all tables succeed."""
 
-    def test_returns_scan_result(self, tmp_path):
+    def test_returns_scan_result(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """classify_tables returns a ScanReport."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
             assert isinstance(result, ScanReport)
         finally:
             adapter.close()
 
-    def test_tables_list_has_one_report_per_input(self, tmp_path):
+    def test_tables_list_has_one_report_per_input(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """All three input tables produce a TableClassificationReport."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
             assert len(result.tables) == 3
             table_names = {r.table for r in result.tables}
@@ -733,27 +648,31 @@ class TestClassifyTablesHappyPath:
         finally:
             adapter.close()
 
-    def test_no_failures_on_clean_run(self, tmp_path):
+    def test_no_failures_on_clean_run(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """failed_tables is empty when all tables succeed."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
             assert result.failed_tables == []
         finally:
             adapter.close()
 
-    def test_each_report_carries_its_table_name(self, tmp_path):
+    def test_each_report_carries_its_table_name(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """Each TableClassificationReport's `table` field matches input."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "orders"], policy, audit)
             # Order is not guaranteed by the function's contract, but
             # the names should round-trip.
@@ -762,14 +681,16 @@ class TestClassifyTablesHappyPath:
         finally:
             adapter.close()
 
-    def test_only_matching_table_finds_classification(self, tmp_path):
+    def test_only_matching_table_finds_classification(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """A policy targeting only 'email' classifies only the users table."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "orders", "products"], policy, audit)
 
             # Find each report by name
@@ -789,32 +710,36 @@ class TestClassifyTablesHappyPath:
 class TestClassifyTablesMetadata:
     """Metadata fields on the returned ScanReport are populated correctly."""
 
-    def test_scan_id_is_a_string(self, tmp_path):
+    def test_scan_id_is_a_string(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """scan_id is populated and is a non-empty string."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit)
             assert isinstance(result.scan_id, str)
             assert len(result.scan_id) > 0
         finally:
             adapter.close()
 
-    def test_scan_id_matches_audit_event_scan_id(self, tmp_path):
+    def test_scan_id_matches_audit_event_scan_id(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """The scan_id on the ScanReport matches the one in audit events.
 
         This is the cross-reference assertion: a renderered report
         and the audit log can be tied together via scan_id.
         """
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit)
 
             # Find SCAN_STARTED in the audit log; its scan_id must match.
@@ -829,28 +754,32 @@ class TestClassifyTablesMetadata:
         finally:
             adapter.close()
 
-    def test_each_call_produces_unique_scan_id(self, tmp_path):
+    def test_each_call_produces_unique_scan_id(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """Two consecutive classify_tables calls produce different scan_ids."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             r1 = classify_tables(adapter, ["users"], policy, audit)
             r2 = classify_tables(adapter, ["users"], policy, audit)
             assert r1.scan_id != r2.scan_id
         finally:
             adapter.close()
 
-    def test_started_at_is_before_completed_at(self, tmp_path):
+    def test_started_at_is_before_completed_at(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """started_at <= completed_at; both are UTC datetimes."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit)
             assert isinstance(result.started_at, datetime)
             assert isinstance(result.completed_at, datetime)
@@ -861,53 +790,61 @@ class TestClassifyTablesMetadata:
         finally:
             adapter.close()
 
-    def test_policy_name_defaults_to_none(self, tmp_path):
+    def test_policy_name_defaults_to_none(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """When the caller doesn't pass policy_name, it stays None."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit)
             assert result.policy_name is None
         finally:
             adapter.close()
 
-    def test_policy_name_propagates(self, tmp_path):
+    def test_policy_name_propagates(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """policy_name passed to classify_tables appears on the ScanReport."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit, policy_name="example")
             assert result.policy_name == "example"
         finally:
             adapter.close()
 
-    def test_target_summary_defaults_to_none(self, tmp_path):
+    def test_target_summary_defaults_to_none(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """When the caller doesn't pass target_summary, it stays None."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users"], policy, audit)
             assert result.target_summary is None
         finally:
             adapter.close()
 
-    def test_target_summary_propagates(self, tmp_path):
+    def test_target_summary_propagates(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """target_summary passed to classify_tables appears on the ScanReport."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             redacted = "sqlite:///" + str(tmp_path) + "/test.db"
             result = classify_tables(adapter, ["users"], policy, audit, target_summary=redacted)
             assert result.target_summary == redacted
@@ -918,42 +855,48 @@ class TestClassifyTablesMetadata:
 class TestClassifyTablesAuditEvents:
     """SCAN_STARTED and SCAN_COMPLETED bookend events."""
 
-    def test_emits_scan_started_event(self, tmp_path):
+    def test_emits_scan_started_event(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """A SCAN_STARTED event is recorded."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users", "orders"], policy, audit)
             event_types = [e.event_type for e in storage.read_all()]
             assert EventType.SCAN_STARTED in event_types
         finally:
             adapter.close()
 
-    def test_emits_scan_completed_event(self, tmp_path):
+    def test_emits_scan_completed_event(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """A SCAN_COMPLETED event is recorded."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users", "orders"], policy, audit)
             event_types = [e.event_type for e in storage.read_all()]
             assert EventType.SCAN_COMPLETED in event_types
         finally:
             adapter.close()
 
-    def test_scan_bookends_have_shared_scan_id(self, tmp_path):
+    def test_scan_bookends_have_shared_scan_id(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """SCAN_STARTED and SCAN_COMPLETED carry the same scan_id."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users"], policy, audit)
 
             events = list(storage.read_all())
@@ -963,14 +906,16 @@ class TestClassifyTablesAuditEvents:
         finally:
             adapter.close()
 
-    def test_scan_started_records_table_count(self, tmp_path):
+    def test_scan_started_records_table_count(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """SCAN_STARTED data includes the input table count."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users", "orders", "products"], policy, audit)
             events = list(storage.read_all())
             started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
@@ -978,14 +923,16 @@ class TestClassifyTablesAuditEvents:
         finally:
             adapter.close()
 
-    def test_scan_completed_records_success_and_failure_counts(self, tmp_path):
+    def test_scan_completed_records_success_and_failure_counts(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """SCAN_COMPLETED records success_count, failure_count, total_classifications."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users", "orders"], policy, audit)
 
             events = list(storage.read_all())
@@ -997,14 +944,16 @@ class TestClassifyTablesAuditEvents:
         finally:
             adapter.close()
 
-    def test_policy_name_propagates_when_provided(self, tmp_path):
+    def test_policy_name_propagates_when_provided(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """If policy_name is provided, SCAN_STARTED carries it."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users"], policy, audit, policy_name="example")
             events = list(storage.read_all())
             started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
@@ -1012,14 +961,16 @@ class TestClassifyTablesAuditEvents:
         finally:
             adapter.close()
 
-    def test_policy_name_omitted_when_not_provided(self, tmp_path):
+    def test_policy_name_omitted_when_not_provided(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """If policy_name is not provided, SCAN_STARTED data has no such key."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users"], policy, audit)
             events = list(storage.read_all())
             started = next(e for e in events if e.event_type == EventType.SCAN_STARTED)
@@ -1027,14 +978,16 @@ class TestClassifyTablesAuditEvents:
         finally:
             adapter.close()
 
-    def test_default_actor_is_classify_tables(self, tmp_path):
+    def test_default_actor_is_classify_tables(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """Without explicit actor, events have actor='classify_tables'."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             classify_tables(adapter, ["users"], policy, audit)
             # The bookend events should have actor='classify_tables'.
             events = list(storage.read_all())
@@ -1052,14 +1005,16 @@ class TestClassifyTablesAuditEvents:
 class TestClassifyTablesErrorHandling:
     """Per-table failures are isolated; the scan continues."""
 
-    def test_missing_table_added_to_failed_tables(self, tmp_path):
+    def test_missing_table_added_to_failed_tables(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """A nonexistent table appears in failed_tables, not in tables."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["users", "ghost_table"], policy, audit)
             successful_names = {r.table for r in result.tables}
             failed_names = {f.name for f in result.failed_tables}
@@ -1068,14 +1023,16 @@ class TestClassifyTablesErrorHandling:
         finally:
             adapter.close()
 
-    def test_scan_continues_after_failure(self, tmp_path):
+    def test_scan_continues_after_failure(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """A failing table in the middle does not stop subsequent tables."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(
                 adapter,
                 ["users", "ghost_table", "orders"],
@@ -1089,14 +1046,16 @@ class TestClassifyTablesErrorHandling:
         finally:
             adapter.close()
 
-    def test_all_tables_fail_returns_empty_tables_list(self, tmp_path):
+    def test_all_tables_fail_returns_empty_tables_list(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """If every input table fails, tables is [] and failed_tables has them all."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["ghost1", "ghost2"], policy, audit)
             assert result.tables == []
             assert len(result.failed_tables) == 2
@@ -1104,28 +1063,32 @@ class TestClassifyTablesErrorHandling:
         finally:
             adapter.close()
 
-    def test_failed_table_carries_error_message(self, tmp_path):
+    def test_failed_table_carries_error_message(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """FailedTable.error is non-empty and human-readable."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             result = classify_tables(adapter, ["ghost_table"], policy, audit)
             assert len(result.failed_tables) == 1
             assert result.failed_tables[0].error  # non-empty string
         finally:
             adapter.close()
 
-    def test_empty_tables_list_returns_empty_result(self, tmp_path):
+    def test_empty_tables_list_returns_empty_result(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """An empty tables input produces an empty ScanReport and still emits bookends."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, storage = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, storage = make_audit_setup()
             result = classify_tables(adapter, [], policy, audit)
             assert result.tables == []
             assert result.failed_tables == []
@@ -1140,14 +1103,16 @@ class TestClassifyTablesErrorHandling:
 class TestClassifyTablesCallbacks:
     """Optional progress callbacks fire at the right moments."""
 
-    def test_on_table_start_invoked_for_each_table(self, tmp_path):
+    def test_on_table_start_invoked_for_each_table(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """on_table_start receives the name of every input table."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             seen: list[str] = []
             classify_tables(
                 adapter,
@@ -1160,14 +1125,16 @@ class TestClassifyTablesCallbacks:
         finally:
             adapter.close()
 
-    def test_on_table_complete_invoked_for_successful_tables(self, tmp_path):
+    def test_on_table_complete_invoked_for_successful_tables(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """on_table_complete fires with the report for each success."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             completed: list[tuple[str, int]] = []
             classify_tables(
                 adapter,
@@ -1184,14 +1151,16 @@ class TestClassifyTablesCallbacks:
         finally:
             adapter.close()
 
-    def test_on_table_failed_invoked_for_failed_tables(self, tmp_path):
+    def test_on_table_failed_invoked_for_failed_tables(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """on_table_failed fires for tables that couldn't be classified."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             failures: list[tuple[str, str]] = []
             classify_tables(
                 adapter,
@@ -1206,14 +1175,16 @@ class TestClassifyTablesCallbacks:
         finally:
             adapter.close()
 
-    def test_callbacks_default_to_none_no_op(self, tmp_path):
+    def test_callbacks_default_to_none_no_op(
+        self, tmp_path, make_dict_rule, make_policy, make_audit_setup, make_multi_table_db_dsn
+    ):
         """If no callbacks are passed, classify_tables runs cleanly."""
-        dsn = _make_multi_table_db(tmp_path)
+        dsn = make_multi_table_db_dsn(tmp_path / "multi.db")
         adapter = SqliteAdapter()
         adapter.connect(dsn)
         try:
-            policy = _make_policy([_dict_rule("email_cols", ["email"])])
-            audit, _ = _make_audit_setup()
+            policy = make_policy([make_dict_rule("email_cols", ["email"])])
+            audit, _ = make_audit_setup()
             # Just verify no error - we're testing that None callbacks
             # don't get invoked.
             result = classify_tables(adapter, ["users"], policy, audit)
