@@ -3,11 +3,14 @@
 This module exposes two table-level classification functions:
 
 - classify_table: classify every column in ONE table. Returns a
-  TableClassificationReport.
+  TableClassificationReport (the per-table primitive).
 
-- classify_tables: classify every column across MANY tables, with
-  per-table failure isolation. Returns a ScanResult containing the
-  per-table reports plus any per-table failures.
+- classify_tables: classify every column across one or more tables,
+  with per-table failure isolation and scan-level metadata. Returns
+  a ScanReport containing the per-table reports, any per-table
+  failures, plus metadata (scan_id, started_at/completed_at,
+  policy_name, target_summary) suitable for rendering as a
+  governance artifact (HTML report).
 
 Both combine a DatabaseAdapter, a ClassificationPolicy, and an
 AuditService into a single function call. Lower-level uses (custom
@@ -20,6 +23,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from pydantic import BaseModel, ConfigDict
 
@@ -193,13 +197,29 @@ class FailedTable(BaseModel):
     error: str
 
 
-class ScanResult(BaseModel):
+class ScanReport(BaseModel):
     """The result of classify_tables.
 
-    Aggregates per-table results plus any per-table failures from
-    a multi-table classification run.
+    Aggregates per-table results, per-table failures, and scan-level
+    metadata from a classification scan. The metadata fields make a
+    ScanReport a self-contained governance artifact: it can be
+    rendered (e.g., as HTML) without re-querying the adapter or
+    re-reading the audit log.
 
     Attributes:
+        scan_id: UUID for this scan. Matches the scan_id recorded on
+            SCAN_STARTED / SCAN_COMPLETED audit events, so a rendered
+            report can be cross-referenced against the audit trail.
+        started_at: UTC timestamp when the scan began (just before
+            SCAN_STARTED was recorded).
+        completed_at: UTC timestamp when the scan finished (just before
+            SCAN_COMPLETED was recorded).
+        policy_name: Name of the policy used (e.g., "example"). Optional
+            because the policy model itself doesn't carry its filename.
+        target_summary: Human-readable description of the database
+            target (e.g., a DSN with the password redacted). Optional
+            for the same reason: the caller knows the DSN, not the
+            engine. Callers passing it are responsible for redaction.
         tables: List of TableClassificationReport, one per
             successfully-classified table. Empty if all tables failed.
         failed_tables: List of FailedTable records, one per table
@@ -216,6 +236,11 @@ class ScanResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    scan_id: str
+    started_at: datetime
+    completed_at: datetime
+    policy_name: str | None
+    target_summary: str | None
     tables: list[TableClassificationReport]
     failed_tables: list[FailedTable]
 
@@ -227,13 +252,14 @@ def classify_tables(
     audit: AuditService,
     *,
     policy_name: str | None = None,
+    target_summary: str | None = None,
     sample_size: int = 1000,
     strategy: SamplingStrategy = SamplingStrategy.SEQUENTIAL,
     actor: str = "classify_tables",
     on_table_start: Callable[[str], None] | None = None,
     on_table_complete: Callable[[str, TableClassificationReport], None] | None = None,
     on_table_failed: Callable[[str, str], None] | None = None,
-) -> ScanResult:
+) -> ScanReport:
     """Classify every column across multiple tables.
 
     Iterates over the given table names, calling classify_table for
@@ -253,6 +279,11 @@ def classify_tables(
             recorded on SCAN_STARTED for audit traceability. The
             policy model itself doesn't carry its filename; the
             caller (typically the CLI) knows it.
+        target_summary: Optional human-readable description of the
+            database target (e.g., DSN with password redacted).
+            Echoed into the returned ScanReport for inclusion in
+            governance artifacts. Callers passing it are responsible
+            for redacting any secrets.
         sample_size: Maximum number of values to sample per column.
         strategy: How to sample values. Default SEQUENTIAL.
         actor: Actor name recorded on audit events. Default
@@ -270,7 +301,8 @@ def classify_tables(
             message string.
 
     Returns:
-        A ScanResult with per-table reports and per-table failures.
+        A ScanReport with per-table reports, per-table failures,
+        and scan-level metadata.
 
     Raises:
         Does not raise for per-table failures (those go in
@@ -278,6 +310,7 @@ def classify_tables(
         caught; other exceptions propagate.
     """
     scan_id = str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
     table_count = len(tables)
 
     # SCAN_STARTED bookend. policy_name only included if provided.
@@ -325,6 +358,8 @@ def classify_tables(
         for report in successful_reports
     )
 
+    completed_at = datetime.now(timezone.utc)
+
     # SCAN_COMPLETED bookend.
     audit.record(
         event_type=EventType.SCAN_COMPLETED,
@@ -338,4 +373,12 @@ def classify_tables(
         },
     )
 
-    return ScanResult(tables=successful_reports, failed_tables=failed)
+    return ScanReport(
+        scan_id=scan_id,
+        started_at=started_at,
+        completed_at=completed_at,
+        policy_name=policy_name,
+        target_summary=target_summary,
+        tables=successful_reports,
+        failed_tables=failed,
+    )

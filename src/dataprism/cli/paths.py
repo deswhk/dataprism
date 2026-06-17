@@ -19,6 +19,7 @@ The pip-install case is deferred; see docs/ARCHITECTURE.md Section 8
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import dataprism
@@ -72,6 +73,7 @@ def get_policy_path(name: str) -> Path:
     """Resolve a policy name to its file path.
 
     A policy NAME (without extension or path) maps to:
+
         <project-root>/config/policies/<name>.yaml
 
     Args:
@@ -84,3 +86,31 @@ def get_policy_path(name: str) -> Path:
     """
     root = get_project_root()
     return root / "config" / "policies" / f"{name}.yaml"
+
+
+def get_report_path(timestamp: datetime) -> Path:
+    """Build the path for an HTML scan report.
+
+    The path is <project-root>/reports/<YYYY-MM-DD-HHMMSS>.html.
+    Creates the reports/ directory if it doesn't exist (idempotent).
+
+    The filename is derived from the passed-in timestamp, so callers
+    can ensure the filename matches a known scan event (typically a
+    ScanReport's completed_at). This makes the file naturally
+    sortable by chronological order and avoids mismatch between the
+    filename and the report's recorded times.
+
+    Args:
+        timestamp: The reference time. Typically scan_report.completed_at.
+            Both naive and tz-aware datetimes work; the encoded time is
+            whatever strftime renders.
+
+    Returns:
+        The absolute path to the HTML report file. Does NOT create
+        the file - the caller writes content to it.
+    """
+    root = get_project_root()
+    reports_dir = root / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    formatted = timestamp.strftime("%Y-%m-%d-%H%M%S")
+    return reports_dir / f"{formatted}.html"
